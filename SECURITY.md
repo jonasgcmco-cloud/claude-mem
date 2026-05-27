@@ -1,14 +1,25 @@
 # Security Policy
 
+## Supported Versions
+
+Only the latest released version of `claude-mem` receives security updates. Please upgrade to the latest version before reporting a vulnerability.
+
+| Version | Supported          |
+| ------- | ------------------ |
+| latest  | :white_check_mark: |
+| older   | :x:                |
+
 ## Reporting a Vulnerability
 
 If you discover a security vulnerability in claude-mem, please report it by:
 
-1. **DO NOT** create a public GitHub issue
-2. Email the maintainer directly with details
-3. Include steps to reproduce, impact assessment, and suggested fixes if possible
+1. **DO NOT** create a public GitHub issue, pull request, or discussion
+2. Email **alex@cmem.ai** with details, OR use GitHub's "Report a vulnerability" button under the Security tab to open a private security advisory
+3. Include steps to reproduce, impact assessment, affected version(s), and suggested fixes if possible
 
-We take security seriously and will respond to valid reports within 48 hours.
+**Scope:** This policy covers the `claude-mem` plugin and its bundled components (hooks, worker service, SQLite/Chroma sync, viewer UI, search/planning skills). Issues in upstream dependencies should be reported to those projects directly, but feel free to flag them to us as well.
+
+We take security seriously, will acknowledge valid reports within 48 hours, and aim to ship a fix in the next release.
 
 ## Security Measures
 
@@ -61,7 +72,6 @@ Tags are stripped at the hook layer before data reaches worker/database.
 ### 2025-12-16: Command Injection Vulnerability (Issue #354)
 - **Severity:** CRITICAL
 - **Status:** RESOLVED
-- **Details:** See [SECURITY_AUDIT_REPORT.md](./SECURITY_AUDIT_REPORT.md)
 - **Affected Versions:** All versions prior to fix
 - **Fixed In:** Current version
 - **Vulnerabilities Found:** 3
@@ -125,7 +135,7 @@ Before submitting a PR with command execution or user input handling:
 - [ ] All spawn/spawnSync calls use array arguments
 - [ ] Input validation is present for all user-controlled parameters
 - [ ] Security tests are added for new attack vectors
-- [ ] Code follows patterns in [SECURITY_AUDIT_REPORT.md](./SECURITY_AUDIT_REPORT.md)
+- [ ] Code follows the safe patterns described above
 
 ## Dependencies
 
@@ -144,7 +154,17 @@ Claude-mem stores data locally in `~/.claude-mem/`:
 - **Logs:** `~/.claude-mem/logs/`
 - **Settings:** `~/.claude-mem/settings.json`
 
-All data remains on the user's machine. No telemetry or external data transmission.
+All claude-mem state files (database, vector store, logs, settings, supervisor and PID files) are written to the local user directory and are not uploaded by claude-mem itself. Claude-mem does not collect telemetry.
+
+However, by design claude-mem invokes upstream model providers and optional integrations to do its work, so observation/transcript/prompt content can leave the machine through those channels:
+
+- **Claude Agent SDK** (default summarization/observation path): sends prompts and transcript context to Anthropic's API.
+- **Alternate providers** (`gemini`, `openrouter`): when configured, send the same context to those providers instead.
+- **Chroma MCP / `chroma-mcp`**: when enabled, computes embeddings via the configured embedding backend, which may be a remote API depending on the user's chroma-mcp configuration.
+- **OAuth / keychain reads**: claude-mem reads the Claude Code OAuth token from the platform-native credential store at spawn time. The token is injected into worker subprocesses but is not transmitted by claude-mem.
+- **GitHub releases / npm registry**: version-check and self-update flows fetch metadata from public registries.
+
+Review your provider/Chroma configuration in `~/.claude-mem/settings.json` and `~/.claude-mem/.env` before sending sensitive content. Use `<private>...</private>` tags to keep specific content out of the local store.
 
 ## Permissions
 
@@ -175,12 +195,12 @@ Security patches are released as soon as possible after discovery. Users should:
 
 For security-related questions (non-vulnerabilities), please:
 
-1. Check [SECURITY_AUDIT_REPORT.md](./SECURITY_AUDIT_REPORT.md) for technical details
-2. Review code comments in security-critical files
-3. Open a GitHub Discussion (not an Issue) for general security questions
+1. Review code comments in security-critical files
+2. Open a GitHub Discussion (not an Issue) for general security questions
+3. For sensitive questions, email **alex@cmem.ai**
 
 ---
 
-**Last Updated:** 2025-12-16
+**Last Updated:** 2026-05-03
 **Last Audit:** 2025-12-16 (Issue #354)
-**Next Scheduled Audit:** 2025-03-16
+**Next Scheduled Audit:** 2026-09-16

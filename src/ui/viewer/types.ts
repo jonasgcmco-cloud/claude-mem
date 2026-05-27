@@ -1,7 +1,9 @@
 export interface Observation {
   id: number;
-  sdk_session_id: string;
+  memory_session_id: string;
   project: string;
+  merged_into_project?: string | null;
+  platform_source: string;
   type: string;
   title: string | null;
   subtitle: string | null;
@@ -20,6 +22,7 @@ export interface Summary {
   id: number;
   session_id: string;
   project: string;
+  platform_source: string;
   request?: string;
   investigated?: string;
   learned?: string;
@@ -30,8 +33,9 @@ export interface Summary {
 
 export interface UserPrompt {
   id: number;
-  claude_session_id: string;
+  content_session_id: string;
   project: string;
+  platform_source: string;
   prompt_number: number;
   prompt_text: string;
   created_at_epoch: number;
@@ -52,6 +56,13 @@ export interface StreamEvent {
   summary?: Summary;
   prompt?: UserPrompt;
   isProcessing?: boolean;
+  queueDepth?: number;
+}
+
+export interface ProjectCatalog {
+  projects: string[];
+  sources: string[];
+  projectsBySource: Record<string, string[]>;
 }
 
 export interface Settings {
@@ -60,22 +71,24 @@ export interface Settings {
   CLAUDE_MEM_WORKER_PORT: string;
   CLAUDE_MEM_WORKER_HOST: string;
 
-  // Token Economics Display
+  CLAUDE_MEM_PROVIDER?: string;  
+  CLAUDE_MEM_GEMINI_API_KEY?: string;
+  CLAUDE_MEM_GEMINI_MODEL?: string;  
+  CLAUDE_MEM_GEMINI_RATE_LIMITING_ENABLED?: string;  
+  CLAUDE_MEM_OPENROUTER_API_KEY?: string;
+  CLAUDE_MEM_OPENROUTER_MODEL?: string;
+  CLAUDE_MEM_OPENROUTER_SITE_URL?: string;
+  CLAUDE_MEM_OPENROUTER_APP_NAME?: string;
+
   CLAUDE_MEM_CONTEXT_SHOW_READ_TOKENS?: string;
   CLAUDE_MEM_CONTEXT_SHOW_WORK_TOKENS?: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_AMOUNT?: string;
   CLAUDE_MEM_CONTEXT_SHOW_SAVINGS_PERCENT?: string;
 
-  // Observation Filtering
-  CLAUDE_MEM_CONTEXT_OBSERVATION_TYPES?: string;
-  CLAUDE_MEM_CONTEXT_OBSERVATION_CONCEPTS?: string;
-
-  // Display Configuration
   CLAUDE_MEM_CONTEXT_FULL_COUNT?: string;
   CLAUDE_MEM_CONTEXT_FULL_FIELD?: string;
   CLAUDE_MEM_CONTEXT_SESSION_COUNT?: string;
 
-  // Feature Toggles
   CLAUDE_MEM_CONTEXT_SHOW_LAST_SUMMARY?: string;
   CLAUDE_MEM_CONTEXT_SHOW_LAST_MESSAGE?: string;
 }
@@ -92,6 +105,7 @@ export interface DatabaseStats {
   observations?: number;
   sessions?: number;
   summaries?: number;
+  firstObservationAt?: string | null;
 }
 
 export interface Stats {

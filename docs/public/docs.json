@@ -36,12 +36,33 @@
           "introduction",
           "installation",
           "usage/getting-started",
+          "usage/openrouter-provider",
+          "usage/gemini-provider",
           "usage/search-tools",
+          "usage/knowledge-agents",
           "usage/claude-desktop",
           "usage/private-tags",
           "usage/export-import",
+          "usage/manual-recovery",
+          "usage/folder-context",
           "beta-features",
           "endless-mode"
+        ]
+      },
+      {
+        "group": "Cursor Integration",
+        "icon": "wand-magic-sparkles",
+        "pages": [
+          "cursor/index",
+          "cursor/gemini-setup",
+          "cursor/openrouter-setup"
+        ]
+      },
+      {
+        "group": "Gemini CLI Integration",
+        "icon": "terminal",
+        "pages": [
+          "gemini-cli/setup"
         ]
       },
       {
@@ -49,7 +70,9 @@
         "icon": "lightbulb",
         "pages": [
           "context-engineering",
-          "progressive-disclosure"
+          "progressive-disclosure",
+          "file-read-gate",
+          "smart-explore-benchmark"
         ]
       },
       {
@@ -57,9 +80,13 @@
         "icon": "gear",
         "pages": [
           "configuration",
+          "configuration/litellm-gateway",
+          "configuration/custom-anthropic-backends",
+          "modes",
           "development",
           "troubleshooting",
-          "platform-integration"
+          "platform-integration",
+          "openclaw-integration"
         ]
       },
       {
@@ -100,7 +127,7 @@
         "header": "Legal",
         "items": [
           {
-            "label": "License (AGPL-3.0)",
+            "label": "License (Apache-2.0)",
             "href": "https://github.com/thedotmack/claude-mem/blob/main/LICENSE"
           }
         ]

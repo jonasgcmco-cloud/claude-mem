@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-/**
- * Cleanup duplicate observations and summaries from the database
- * Keeps the earliest entry (MIN(id)) for each duplicate group
- */
 
 import { SessionStore } from '../services/sqlite/SessionStore.js';
 
@@ -11,18 +7,17 @@ function main() {
 
   const db = new SessionStore();
 
-  // Find and delete duplicate observations
   console.log('Finding duplicate observations...');
 
   const duplicateObsQuery = db['db'].prepare(`
-    SELECT sdk_session_id, title, subtitle, type, COUNT(*) as count, GROUP_CONCAT(id) as ids
+    SELECT memory_session_id, title, subtitle, type, COUNT(*) as count, GROUP_CONCAT(id) as ids
     FROM observations
-    GROUP BY sdk_session_id, title, subtitle, type
+    GROUP BY memory_session_id, title, subtitle, type
     HAVING count > 1
   `);
 
   const duplicateObs = duplicateObsQuery.all() as Array<{
-    sdk_session_id: string;
+    memory_session_id: string;
     title: string;
     subtitle: string;
     type: string;
@@ -46,18 +41,17 @@ function main() {
     deletedObs += deleteIds.length;
   }
 
-  // Find and delete duplicate summaries
   console.log('\n\nFinding duplicate summaries...');
 
   const duplicateSumQuery = db['db'].prepare(`
-    SELECT sdk_session_id, request, completed, learned, COUNT(*) as count, GROUP_CONCAT(id) as ids
+    SELECT memory_session_id, request, completed, learned, COUNT(*) as count, GROUP_CONCAT(id) as ids
     FROM session_summaries
-    GROUP BY sdk_session_id, request, completed, learned
+    GROUP BY memory_session_id, request, completed, learned
     HAVING count > 1
   `);
 
   const duplicateSum = duplicateSumQuery.all() as Array<{
-    sdk_session_id: string;
+    memory_session_id: string;
     request: string;
     completed: string;
     learned: string;
@@ -92,7 +86,6 @@ function main() {
   console.log('='.repeat(60));
 }
 
-// Run if executed directly
 if (import.meta.url === `file://${process.argv[1]}`) {
   main();
 }

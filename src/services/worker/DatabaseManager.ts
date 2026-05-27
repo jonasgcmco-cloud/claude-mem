@@ -1,71 +1,52 @@
-/**
- * DatabaseManager: Single long-lived database connection
- *
- * Responsibility:
- * - Manage single database connection for worker lifetime
- * - Provide centralized access to SessionStore and SessionSearch
- * - High-level database operations
- * - ChromaSync integration
- */
 
+import { Database } from 'bun:sqlite';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { SessionSearch } from '../sqlite/SessionSearch.js';
 import { ChromaSync } from '../sync/ChromaSync.js';
+import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
+import { USER_SETTINGS_PATH, DB_PATH } from '../../shared/paths.js';
 import { logger } from '../../utils/logger.js';
 import type { DBSession } from '../worker-types.js';
 
 export class DatabaseManager {
+  private db: Database | null = null;
   private sessionStore: SessionStore | null = null;
   private sessionSearch: SessionSearch | null = null;
   private chromaSync: ChromaSync | null = null;
 
-  /**
-   * Initialize database connection (once, stays open)
-   */
   async initialize(): Promise<void> {
-    // Open database connection (ONCE)
-    this.sessionStore = new SessionStore();
-    this.sessionSearch = new SessionSearch();
+    this.db = new Database(DB_PATH);
+    
+    this.sessionStore = new SessionStore(this.db);
+    this.sessionSearch = new SessionSearch(this.db);
 
-    // Initialize ChromaSync
-    this.chromaSync = new ChromaSync('claude-mem');
+    const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
+    const chromaEnabled = settings.CLAUDE_MEM_CHROMA_ENABLED !== 'false';
+    if (chromaEnabled) {
+      this.chromaSync = new ChromaSync('claude-mem');
+    } else {
+      logger.info('DB', 'Chroma disabled via CLAUDE_MEM_CHROMA_ENABLED=false, using SQLite-only search');
+    }
 
-    // Start background backfill (fire-and-forget, with error logging)
-    this.chromaSync.ensureBackfilled().catch((error) => {
-      logger.error('DB', 'Chroma backfill failed (non-fatal)', {}, error);
-    });
-
-    logger.info('DB', 'Database initialized');
+    logger.info('DB', 'Database initialized (shared connection)');
   }
 
-  /**
-   * Close database connection and cleanup all resources
-   */
   async close(): Promise<void> {
-    // Close ChromaSync first (terminates uvx/python processes)
     if (this.chromaSync) {
-      try {
-        await this.chromaSync.close();
-        this.chromaSync = null;
-      } catch (error) {
-        logger.error('DB', 'Failed to close ChromaSync', {}, error as Error);
-      }
+      await this.chromaSync.close();
+      this.chromaSync = null;
     }
-    
-    if (this.sessionStore) {
-      this.sessionStore.close();
-      this.sessionStore = null;
-    }
-    if (this.sessionSearch) {
-      this.sessionSearch.close();
-      this.sessionSearch = null;
+
+    this.sessionStore = null;
+    this.sessionSearch = null;
+
+    if (this.db) {
+      this.db.close();
+      this.db = null;
     }
     logger.info('DB', 'Database closed');
   }
 
-  /**
-   * Get SessionStore instance (throws if not initialized)
-   */
   getSessionStore(): SessionStore {
     if (!this.sessionStore) {
       throw new Error('Database not initialized');
@@ -73,9 +54,6 @@ export class DatabaseManager {
     return this.sessionStore;
   }
 
-  /**
-   * Get SessionSearch instance (throws if not initialized)
-   */
   getSessionSearch(): SessionSearch {
     if (!this.sessionSearch) {
       throw new Error('Database not initialized');
@@ -83,29 +61,26 @@ export class DatabaseManager {
     return this.sessionSearch;
   }
 
-  /**
-   * Get ChromaSync instance (throws if not initialized)
-   */
-  getChromaSync(): ChromaSync {
-    if (!this.chromaSync) {
-      throw new Error('ChromaSync not initialized');
-    }
+  getChromaSync(): ChromaSync | null {
     return this.chromaSync;
   }
 
-  // REMOVED: cleanupOrphanedSessions - violates "EVERYTHING SHOULD SAVE ALWAYS"
-  // Worker restarts don't make sessions orphaned. Sessions are managed by hooks
-  // and exist independently of worker state.
+  getConnection(): Database {
+    if (!this.db) {
+      throw new Error('Database not initialized');
+    }
+    return this.db;
+  }
 
-  /**
-   * Get session by ID (throws if not found)
-   */
   getSessionById(sessionDbId: number): {
     id: number;
-    claude_session_id: string;
-    sdk_session_id: string | null;
+    content_session_id: string;
+    memory_session_id: string | null;
     project: string;
+    platform_source: string;
     user_prompt: string;
+    custom_title: string | null;
+    status: string;
   } {
     const session = this.getSessionStore().getSessionById(sessionDbId);
     if (!session) {
@@ -114,10 +89,4 @@ export class DatabaseManager {
     return session;
   }
 
-  /**
-   * Mark session as completed
-   */
-  markSessionComplete(sessionDbId: number): void {
-    this.getSessionStore().markSessionCompleted(sessionDbId);
-  }
 }

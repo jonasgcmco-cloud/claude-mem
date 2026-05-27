@@ -1,19 +1,21 @@
 export const HOOK_TIMEOUTS = {
-  DEFAULT: 5000,              // Standard HTTP timeout (up from 2000ms)
-  HEALTH_CHECK: 1000,         // Worker health check (up from 500ms)
+  DEFAULT: 300000,            // Standard HTTP timeout (5 min for slow systems)
+  HEALTH_CHECK: 3000,         // Worker health check (3s — healthy worker responds in <100ms)
+  API_REQUEST: 30000,         // Hook API calls should outlive health probes but stay below hook caps
+  HOOK_READINESS_WAIT: 10000, // Per-hook wait for an already-starting worker to finish DB/search init
+  POST_SPAWN_WAIT: 15000,     // Wait for daemon to start after spawn (starts in <1s on Linux, 6-8s on macOS with Chroma)
+  READINESS_WAIT: 30000,      // Wait for DB + search init after spawn (typically <5s)
+  PORT_IN_USE_WAIT: 3000,     // Wait when port occupied but health failing
   WORKER_STARTUP_WAIT: 1000,
-  WORKER_STARTUP_RETRIES: 15,
   PRE_RESTART_SETTLE_DELAY: 2000,  // Give files time to sync before restart
-  WINDOWS_MULTIPLIER: 1.5     // Platform-specific adjustment
+  POWERSHELL_COMMAND: 10000,     // PowerShell process enumeration (10s - typically completes in <1s)
+  WINDOWS_MULTIPLIER: 1.5     
 } as const;
 
-/**
- * Hook exit codes for Claude Code
- */
 export const HOOK_EXIT_CODES = {
   SUCCESS: 0,
   FAILURE: 1,
-  /** Show user message that Claude does NOT receive as context */
+  BLOCKING_ERROR: 2,
   USER_MESSAGE_ONLY: 3,
 } as const;
 

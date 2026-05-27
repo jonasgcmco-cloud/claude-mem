@@ -1,22 +1,10 @@
-/**
- * ChromaSync Service
- *
- * Automatically syncs observations and session summaries to ChromaDB via MCP.
- * This service provides real-time semantic search capabilities by maintaining
- * a vector database synchronized with SQLite.
- *
- * Design: Fail-fast with no fallbacks - if Chroma is unavailable, syncing fails.
- */
 
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ChromaMcpManager } from './ChromaMcpManager.js';
+import { ChromaSyncState, ProjectWatermarks } from './ChromaSyncState.js';
 import { ParsedObservation, ParsedSummary } from '../../sdk/parser.js';
 import { SessionStore } from '../sqlite/SessionStore.js';
 import { logger } from '../../utils/logger.js';
-import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
-import { USER_SETTINGS_PATH } from '../../shared/paths.js';
-import path from 'path';
-import os from 'os';
+import { parseFileList } from '../sqlite/observations/files.js';
 
 interface ChromaDocument {
   id: string;
@@ -26,27 +14,29 @@ interface ChromaDocument {
 
 interface StoredObservation {
   id: number;
-  sdk_session_id: string;
+  memory_session_id: string;
   project: string;
+  merged_into_project: string | null;
   text: string | null;
   type: string;
   title: string | null;
   subtitle: string | null;
-  facts: string | null; // JSON
+  facts: string | null; 
   narrative: string | null;
-  concepts: string | null; // JSON
-  files_read: string | null; // JSON
-  files_modified: string | null; // JSON
+  concepts: string | null; 
+  files_read: string | null; 
+  files_modified: string | null; 
   prompt_number: number;
-  discovery_tokens: number; // ROI metrics
+  discovery_tokens: number; 
   created_at: string;
   created_at_epoch: number;
 }
 
 interface StoredSummary {
   id: number;
-  sdk_session_id: string;
+  memory_session_id: string;
   project: string;
+  merged_into_project: string | null;
   request: string | null;
   investigated: string | null;
   learned: string | null;
@@ -54,150 +44,80 @@ interface StoredSummary {
   next_steps: string | null;
   notes: string | null;
   prompt_number: number;
-  discovery_tokens: number; // ROI metrics
+  discovery_tokens: number; 
   created_at: string;
   created_at_epoch: number;
 }
 
 interface StoredUserPrompt {
   id: number;
-  claude_session_id: string;
+  content_session_id: string;
   prompt_number: number;
   prompt_text: string;
   created_at: string;
   created_at_epoch: number;
-  sdk_session_id: string;
+  memory_session_id: string;
   project: string;
 }
 
 export class ChromaSync {
-  private client: Client | null = null;
-  private transport: StdioClientTransport | null = null;
-  private connected: boolean = false;
   private project: string;
   private collectionName: string;
-  private readonly VECTOR_DB_DIR: string;
+  private collectionCreated = false;
   private readonly BATCH_SIZE = 100;
 
   constructor(project: string) {
     this.project = project;
-    this.collectionName = `cm__${project}`;
-    this.VECTOR_DB_DIR = path.join(os.homedir(), '.claude-mem', 'vector-db');
+    const sanitized = project
+      .replace(/[^a-zA-Z0-9._-]/g, '_')
+      .replace(/[^a-zA-Z0-9]+$/, '');  
+    this.collectionName = `cm__${sanitized || 'unknown'}`;
   }
 
-  /**
-   * Ensure MCP client is connected to Chroma server
-   * Throws error if connection fails
-   */
-  private async ensureConnection(): Promise<void> {
-    if (this.connected && this.client) {
+  private async ensureCollectionExists(): Promise<void> {
+    if (this.collectionCreated) {
       return;
     }
 
-    logger.info('CHROMA_SYNC', 'Connecting to Chroma MCP server...', { project: this.project });
-
+    const chromaMcp = ChromaMcpManager.getInstance();
     try {
-      // Use Python 3.13 by default to avoid onnxruntime compatibility issues with Python 3.14+
-      // See: https://github.com/thedotmack/claude-mem/issues/170 (Python 3.14 incompatibility)
-      const settings = SettingsDefaultsManager.loadFromFile(USER_SETTINGS_PATH);
-      const pythonVersion = settings.CLAUDE_MEM_PYTHON_VERSION;
-      this.transport = new StdioClientTransport({
-        command: 'uvx',
-        args: [
-          '--python', pythonVersion,
-          'chroma-mcp',
-          '--client-type', 'persistent',
-          '--data-dir', this.VECTOR_DB_DIR
-        ],
-        stderr: 'ignore'
+      await chromaMcp.callTool('chroma_create_collection', {
+        collection_name: this.collectionName
       });
-
-      this.client = new Client({
-        name: 'claude-mem-chroma-sync',
-        version: '1.0.0'
-      }, {
-        capabilities: {}
-      });
-
-      await this.client.connect(this.transport);
-      this.connected = true;
-
-      logger.info('CHROMA_SYNC', 'Connected to Chroma MCP server', { project: this.project });
     } catch (error) {
-      logger.error('CHROMA_SYNC', 'Failed to connect to Chroma MCP server', { project: this.project }, error as Error);
-      throw new Error(`Chroma connection failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  /**
-   * Ensure collection exists, create if needed
-   * Throws error if collection creation fails
-   */
-  private async ensureCollection(): Promise<void> {
-    await this.ensureConnection();
-
-    if (!this.client) {
-      throw new Error(
-        'Chroma client not initialized. Call ensureConnection() before using client methods.' +
-        ` Project: ${this.project}`
-      );
-    }
-
-    try {
-      // Try to get collection info (will fail if doesn't exist)
-      await this.client.callTool({
-        name: 'chroma_get_collection_info',
-        arguments: {
-          collection_name: this.collectionName
-        }
-      });
-
-      logger.debug('CHROMA_SYNC', 'Collection exists', { collection: this.collectionName });
-    } catch (error) {
-      // Collection doesn't exist, create it
-      logger.info('CHROMA_SYNC', 'Creating collection', { collection: this.collectionName });
-
-      try {
-        await this.client.callTool({
-          name: 'chroma_create_collection',
-          arguments: {
-            collection_name: this.collectionName,
-            embedding_function_name: 'default'
-          }
-        });
-
-        logger.info('CHROMA_SYNC', 'Collection created', { collection: this.collectionName });
-      } catch (createError) {
-        logger.error('CHROMA_SYNC', 'Failed to create collection', { collection: this.collectionName }, createError as Error);
-        throw new Error(`Collection creation failed: ${createError instanceof Error ? createError.message : String(createError)}`);
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes('already exists')) {
+        throw error;
       }
+      // Collection already exists - this is the expected path after first creation
     }
+
+    this.collectionCreated = true;
+
+    logger.debug('CHROMA_SYNC', 'Collection ready', {
+      collection: this.collectionName
+    });
   }
 
-  /**
-   * Format observation into Chroma documents (granular approach)
-   * Each semantic field becomes a separate vector document
-   */
   private formatObservationDocs(obs: StoredObservation): ChromaDocument[] {
     const documents: ChromaDocument[] = [];
 
-    // Parse JSON fields
     const facts = obs.facts ? JSON.parse(obs.facts) : [];
     const concepts = obs.concepts ? JSON.parse(obs.concepts) : [];
-    const files_read = obs.files_read ? JSON.parse(obs.files_read) : [];
-    const files_modified = obs.files_modified ? JSON.parse(obs.files_modified) : [];
+    const files_read = parseFileList(obs.files_read);
+    const files_modified = parseFileList(obs.files_modified);
 
-    const baseMetadata: Record<string, string | number> = {
+    const baseMetadata: Record<string, string | number | null> = {
       sqlite_id: obs.id,
       doc_type: 'observation',
-      sdk_session_id: obs.sdk_session_id,
+      memory_session_id: obs.memory_session_id,
       project: obs.project,
+      merged_into_project: obs.merged_into_project ?? null,
       created_at_epoch: obs.created_at_epoch,
       type: obs.type || 'discovery',
       title: obs.title || 'Untitled'
     };
 
-    // Add optional metadata fields
     if (obs.subtitle) {
       baseMetadata.subtitle = obs.subtitle;
     }
@@ -211,7 +131,6 @@ export class ChromaSync {
       baseMetadata.files_modified = files_modified.join(',');
     }
 
-    // Narrative as separate document
     if (obs.narrative) {
       documents.push({
         id: `obs_${obs.id}_narrative`,
@@ -220,7 +139,6 @@ export class ChromaSync {
       });
     }
 
-    // Text as separate document (legacy field)
     if (obs.text) {
       documents.push({
         id: `obs_${obs.id}_text`,
@@ -229,7 +147,6 @@ export class ChromaSync {
       });
     }
 
-    // Each fact as separate document
     facts.forEach((fact: string, index: number) => {
       documents.push({
         id: `obs_${obs.id}_fact_${index}`,
@@ -241,23 +158,19 @@ export class ChromaSync {
     return documents;
   }
 
-  /**
-   * Format summary into Chroma documents (granular approach)
-   * Each summary field becomes a separate vector document
-   */
   private formatSummaryDocs(summary: StoredSummary): ChromaDocument[] {
     const documents: ChromaDocument[] = [];
 
-    const baseMetadata: Record<string, string | number> = {
+    const baseMetadata: Record<string, string | number | null> = {
       sqlite_id: summary.id,
       doc_type: 'session_summary',
-      sdk_session_id: summary.sdk_session_id,
+      memory_session_id: summary.memory_session_id,
       project: summary.project,
+      merged_into_project: summary.merged_into_project ?? null,
       created_at_epoch: summary.created_at_epoch,
       prompt_number: summary.prompt_number || 0
     };
 
-    // Each field becomes a separate document
     if (summary.request) {
       documents.push({
         id: `summary_${summary.id}_request`,
@@ -310,65 +223,100 @@ export class ChromaSync {
   }
 
   /**
-   * Add documents to Chroma in batch
-   * Throws error if batch add fails
+   * Write `documents` to Chroma in BATCH_SIZE-sized batches.
+   *
+   * Returns the number of documents that were successfully written (or
+   * confirmed via delete+add reconcile). Per-batch failures are logged and the
+   * loop continues — we never throw — so callers must use the returned count
+   * to advance their watermark, otherwise an interrupted backfill can mark
+   * unsynced records as synced.
    */
-  private async addDocuments(documents: ChromaDocument[]): Promise<void> {
+  private async addDocuments(documents: ChromaDocument[]): Promise<number> {
     if (documents.length === 0) {
-      return;
+      return 0;
     }
 
-    await this.ensureCollection();
+    await this.ensureCollectionExists();
 
-    if (!this.client) {
-      throw new Error(
-        'Chroma client not initialized. Call ensureConnection() before using client methods.' +
-        ` Project: ${this.project}`
+    const chromaMcp = ChromaMcpManager.getInstance();
+
+    let written = 0;
+    for (let i = 0; i < documents.length; i += this.BATCH_SIZE) {
+      const batch = documents.slice(i, i + this.BATCH_SIZE);
+
+      const cleanMetadatas = batch.map(d =>
+        Object.fromEntries(
+          Object.entries(d.metadata).filter(([_, v]) => v !== null && v !== undefined && v !== '')
+        )
       );
-    }
 
-    try {
-      await this.client.callTool({
-        name: 'chroma_add_documents',
-        arguments: {
+      try {
+        await chromaMcp.callTool('chroma_add_documents', {
           collection_name: this.collectionName,
-          documents: documents.map(d => d.document),
-          ids: documents.map(d => d.id),
-          metadatas: documents.map(d => d.metadata)
+          ids: batch.map(d => d.id),
+          documents: batch.map(d => d.document),
+          metadatas: cleanMetadatas
+        });
+        written += batch.length;
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        if (errMsg.includes('already exist')) {
+          try {
+            await chromaMcp.callTool('chroma_delete_documents', {
+              collection_name: this.collectionName,
+              ids: batch.map(d => d.id)
+            });
+            await chromaMcp.callTool('chroma_add_documents', {
+              collection_name: this.collectionName,
+              ids: batch.map(d => d.id),
+              documents: batch.map(d => d.document),
+              metadatas: cleanMetadatas
+            });
+            written += batch.length;
+            logger.info('CHROMA_SYNC', 'Batch reconciled via delete+add after duplicate conflict', {
+              collection: this.collectionName,
+              batchStart: i,
+              batchSize: batch.length
+            });
+          } catch (reconcileError) {
+            logger.error('CHROMA_SYNC', 'Batch reconcile (delete+add) failed — watermark will not advance for this batch', {
+              collection: this.collectionName,
+              batchStart: i,
+              batchSize: batch.length
+            }, reconcileError as Error);
+          }
+        } else {
+          logger.error('CHROMA_SYNC', 'Batch add failed — watermark will not advance for this batch, continuing with remaining batches', {
+            collection: this.collectionName,
+            batchStart: i,
+            batchSize: batch.length
+          }, error as Error);
         }
-      });
-
-      logger.debug('CHROMA_SYNC', 'Documents added', {
-        collection: this.collectionName,
-        count: documents.length
-      });
-    } catch (error) {
-      logger.error('CHROMA_SYNC', 'Failed to add documents', {
-        collection: this.collectionName,
-        count: documents.length
-      }, error as Error);
-      throw new Error(`Document add failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
+
+    logger.debug('CHROMA_SYNC', 'Documents added', {
+      collection: this.collectionName,
+      requested: documents.length,
+      written
+    });
+    return written;
   }
 
-  /**
-   * Sync a single observation to Chroma
-   * Blocks until sync completes, throws on error
-   */
   async syncObservation(
     observationId: number,
-    sdkSessionId: string,
+    memorySessionId: string,
     project: string,
     obs: ParsedObservation,
     promptNumber: number,
     createdAtEpoch: number,
     discoveryTokens: number = 0
   ): Promise<void> {
-    // Convert ParsedObservation to StoredObservation format
     const stored: StoredObservation = {
       id: observationId,
-      sdk_session_id: sdkSessionId,
+      memory_session_id: memorySessionId,
       project: project,
+      merged_into_project: null,
       text: null, // Legacy field, not used
       type: obs.type,
       title: obs.title,
@@ -392,27 +340,38 @@ export class ChromaSync {
       project
     });
 
-    await this.addDocuments(documents);
+    // Only advance the watermark on a confirmed full write. addDocuments() now
+    // returns a written count and tolerates per-batch failures, so a transient
+    // Chroma error must NOT mark this observation as synced — otherwise the
+    // backfill pass on next boot will skip past it (CodeRabbit review on PR
+    // #2282).
+    const written = await this.addDocuments(documents);
+    if (written === documents.length) {
+      ChromaSyncState.bump(project, 'observations', observationId);
+    } else {
+      logger.warn('CHROMA_SYNC', 'Observation watermark bump skipped — partial write', {
+        observationId,
+        project,
+        requested: documents.length,
+        written
+      });
+    }
   }
 
-  /**
-   * Sync a single summary to Chroma
-   * Blocks until sync completes, throws on error
-   */
   async syncSummary(
     summaryId: number,
-    sdkSessionId: string,
+    memorySessionId: string,
     project: string,
     summary: ParsedSummary,
     promptNumber: number,
     createdAtEpoch: number,
     discoveryTokens: number = 0
   ): Promise<void> {
-    // Convert ParsedSummary to StoredSummary format
     const stored: StoredSummary = {
       id: summaryId,
-      sdk_session_id: sdkSessionId,
+      memory_session_id: memorySessionId,
       project: project,
+      merged_into_project: null,
       request: summary.request,
       investigated: summary.investigated,
       learned: summary.learned,
@@ -433,13 +392,20 @@ export class ChromaSync {
       project
     });
 
-    await this.addDocuments(documents);
+    // Only bump on a confirmed full write — see syncObservation() for rationale.
+    const written = await this.addDocuments(documents);
+    if (written === documents.length) {
+      ChromaSyncState.bump(project, 'summaries', summaryId);
+    } else {
+      logger.warn('CHROMA_SYNC', 'Summary watermark bump skipped — partial write', {
+        summaryId,
+        project,
+        requested: documents.length,
+        written
+      });
+    }
   }
 
-  /**
-   * Format user prompt into Chroma document
-   * Each prompt becomes a single document (unlike observations/summaries which split by field)
-   */
   private formatUserPromptDoc(prompt: StoredUserPrompt): ChromaDocument {
     return {
       id: `prompt_${prompt.id}`,
@@ -447,7 +413,7 @@ export class ChromaSync {
       metadata: {
         sqlite_id: prompt.id,
         doc_type: 'user_prompt',
-        sdk_session_id: prompt.sdk_session_id,
+        memory_session_id: prompt.memory_session_id,
         project: prompt.project,
         created_at_epoch: prompt.created_at_epoch,
         prompt_number: prompt.prompt_number
@@ -455,27 +421,22 @@ export class ChromaSync {
     };
   }
 
-  /**
-   * Sync a single user prompt to Chroma
-   * Blocks until sync completes, throws on error
-   */
   async syncUserPrompt(
     promptId: number,
-    sdkSessionId: string,
+    memorySessionId: string,
     project: string,
     promptText: string,
     promptNumber: number,
     createdAtEpoch: number
   ): Promise<void> {
-    // Create StoredUserPrompt format
     const stored: StoredUserPrompt = {
       id: promptId,
-      claude_session_id: '', // Not needed for Chroma sync
+      content_session_id: '', // Not needed for Chroma sync
       prompt_number: promptNumber,
       prompt_text: promptText,
       created_at: new Date(createdAtEpoch * 1000).toISOString(),
       created_at_epoch: createdAtEpoch,
-      sdk_session_id: sdkSessionId,
+      memory_session_id: memorySessionId,
       project: project
     };
 
@@ -486,381 +447,653 @@ export class ChromaSync {
       project
     });
 
-    await this.addDocuments([document]);
+    // Only bump on a confirmed full write — see syncObservation() for rationale.
+    const written = await this.addDocuments([document]);
+    if (written === 1) {
+      ChromaSyncState.bump(project, 'prompts', promptId);
+    } else {
+      logger.warn('CHROMA_SYNC', 'Prompt watermark bump skipped — write failed', {
+        promptId,
+        project,
+        written
+      });
+    }
   }
 
-  /**
-   * Fetch all existing document IDs from Chroma collection
-   * Returns Sets of SQLite IDs for observations, summaries, and prompts
-   */
-  private async getExistingChromaIds(): Promise<{
+  private async getExistingChromaIds(projectOverride?: string): Promise<{
     observations: Set<number>;
     summaries: Set<number>;
     prompts: Set<number>;
   }> {
-    await this.ensureConnection();
+    const targetProject = projectOverride ?? this.project;
+    await this.ensureCollectionExists();
 
-    if (!this.client) {
-      throw new Error(
-        'Chroma client not initialized. Call ensureConnection() before using client methods.' +
-        ` Project: ${this.project}`
-      );
-    }
+    const chromaMcp = ChromaMcpManager.getInstance();
 
     const observationIds = new Set<number>();
     const summaryIds = new Set<number>();
     const promptIds = new Set<number>();
 
     let offset = 0;
-    const limit = 1000; // Large batches, metadata only = fast
+    const limit = 1000; 
 
-    logger.info('CHROMA_SYNC', 'Fetching existing Chroma document IDs...', { project: this.project });
+    logger.info('CHROMA_SYNC', 'Fetching existing Chroma document IDs...', { project: targetProject });
 
     while (true) {
-      try {
-        const result = await this.client.callTool({
-          name: 'chroma_get_documents',
-          arguments: {
-            collection_name: this.collectionName,
-            limit,
-            offset,
-            where: { project: this.project }, // Filter by project
-            include: ['metadatas']
-          }
-        });
+      const result = await chromaMcp.callTool('chroma_get_documents', {
+        collection_name: this.collectionName,
+        limit: limit,
+        offset: offset,
+        where: { project: targetProject },
+        include: ['metadatas']
+      }) as any;
 
-        const data = result.content[0];
-        if (data.type !== 'text') {
-          throw new Error('Unexpected response type from chroma_get_documents');
-        }
+      const metadatas = result?.metadatas || [];
 
-        const parsed = JSON.parse(data.text);
-        const metadatas = parsed.metadatas || [];
-
-        if (metadatas.length === 0) {
-          break; // No more documents
-        }
-
-        // Extract SQLite IDs from metadata
-        for (const meta of metadatas) {
-          if (meta.sqlite_id) {
-            if (meta.doc_type === 'observation') {
-              observationIds.add(meta.sqlite_id);
-            } else if (meta.doc_type === 'session_summary') {
-              summaryIds.add(meta.sqlite_id);
-            } else if (meta.doc_type === 'user_prompt') {
-              promptIds.add(meta.sqlite_id);
-            }
-          }
-        }
-
-        offset += limit;
-
-        logger.debug('CHROMA_SYNC', 'Fetched batch of existing IDs', {
-          project: this.project,
-          offset,
-          batchSize: metadatas.length
-        });
-      } catch (error) {
-        logger.error('CHROMA_SYNC', 'Failed to fetch existing IDs', { project: this.project }, error as Error);
-        throw error;
+      if (metadatas.length === 0) {
+        break; 
       }
+
+      for (const meta of metadatas) {
+        if (meta && meta.sqlite_id) {
+          const sqliteId = meta.sqlite_id as number;
+          if (meta.doc_type === 'observation') {
+            observationIds.add(sqliteId);
+          } else if (meta.doc_type === 'session_summary') {
+            summaryIds.add(sqliteId);
+          } else if (meta.doc_type === 'user_prompt') {
+            promptIds.add(sqliteId);
+          }
+        }
+      }
+
+      offset += limit;
+
+      logger.debug('CHROMA_SYNC', 'Fetched batch of existing IDs', {
+        project: targetProject,
+        offset,
+        batchSize: metadatas.length
+      });
     }
 
     logger.info('CHROMA_SYNC', 'Existing IDs fetched', {
-      project: this.project,
+      project: targetProject,
       observations: observationIds.size,
       summaries: summaryIds.size,
-      prompts: promptIds.size
+      prompts: promptIds.size,
+      total: observationIds.size + summaryIds.size + promptIds.size
     });
 
     return { observations: observationIds, summaries: summaryIds, prompts: promptIds };
   }
 
-  /**
-   * Backfill: Sync all observations missing from Chroma
-   * Reads from SQLite and syncs in batches
-   * Throws error if backfill fails
-   */
-  async ensureBackfilled(): Promise<void> {
-    logger.info('CHROMA_SYNC', 'Starting smart backfill', { project: this.project });
+  async bootstrapWatermarksFromChroma(project: string): Promise<void> {
+    const existing = await this.getExistingChromaIds(project);
+    const max = (set: Set<number>): number => {
+      let m = 0;
+      for (const id of set) if (id > m) m = id;
+      return m;
+    };
+    ChromaSyncState.replace(project, {
+      observations: max(existing.observations),
+      summaries: max(existing.summaries),
+      prompts: max(existing.prompts)
+    });
+    logger.info('CHROMA_SYNC', 'Bootstrapped watermarks from Chroma', {
+      project,
+      watermarks: ChromaSyncState.get(project)
+    });
+  }
 
-    await this.ensureCollection();
+  async ensureBackfilled(projectOverride?: string, storeOverride?: SessionStore): Promise<void> {
+    const backfillProject = projectOverride ?? this.project;
+    logger.info('CHROMA_SYNC', 'Starting smart backfill', { project: backfillProject });
 
-    // Fetch existing IDs from Chroma (fast, metadata only)
-    const existing = await this.getExistingChromaIds();
+    await this.ensureCollectionExists();
 
-    const db = new SessionStore();
+    const watermarks = ChromaSyncState.get(backfillProject);
+
+    const db = storeOverride ?? new SessionStore();
 
     try {
-      // Build exclusion list for observations
-      const existingObsIds = Array.from(existing.observations);
-      const obsExclusionClause = existingObsIds.length > 0
-        ? `AND id NOT IN (${existingObsIds.join(',')})`
-        : '';
-
-      // Get only observations missing from Chroma
-      const observations = db.db.prepare(`
-        SELECT * FROM observations
-        WHERE project = ? ${obsExclusionClause}
-        ORDER BY id ASC
-      `).all(this.project) as StoredObservation[];
-
-      const totalObsCount = db.db.prepare(`
-        SELECT COUNT(*) as count FROM observations WHERE project = ?
-      `).get(this.project) as { count: number };
-
-      logger.info('CHROMA_SYNC', 'Backfilling observations', {
-        project: this.project,
-        missing: observations.length,
-        existing: existing.observations.size,
-        total: totalObsCount.count
-      });
-
-      // Format all observation documents
-      const allDocs: ChromaDocument[] = [];
-      for (const obs of observations) {
-        allDocs.push(...this.formatObservationDocs(obs));
-      }
-
-      // Sync in batches
-      for (let i = 0; i < allDocs.length; i += this.BATCH_SIZE) {
-        const batch = allDocs.slice(i, i + this.BATCH_SIZE);
-        await this.addDocuments(batch);
-
-        logger.info('CHROMA_SYNC', 'Backfill progress', {
-          project: this.project,
-          progress: `${Math.min(i + this.BATCH_SIZE, allDocs.length)}/${allDocs.length}`
-        });
-      }
-
-      // Build exclusion list for summaries
-      const existingSummaryIds = Array.from(existing.summaries);
-      const summaryExclusionClause = existingSummaryIds.length > 0
-        ? `AND id NOT IN (${existingSummaryIds.join(',')})`
-        : '';
-
-      // Get only summaries missing from Chroma
-      const summaries = db.db.prepare(`
-        SELECT * FROM session_summaries
-        WHERE project = ? ${summaryExclusionClause}
-        ORDER BY id ASC
-      `).all(this.project) as StoredSummary[];
-
-      const totalSummaryCount = db.db.prepare(`
-        SELECT COUNT(*) as count FROM session_summaries WHERE project = ?
-      `).get(this.project) as { count: number };
-
-      logger.info('CHROMA_SYNC', 'Backfilling summaries', {
-        project: this.project,
-        missing: summaries.length,
-        existing: existing.summaries.size,
-        total: totalSummaryCount.count
-      });
-
-      // Format all summary documents
-      const summaryDocs: ChromaDocument[] = [];
-      for (const summary of summaries) {
-        summaryDocs.push(...this.formatSummaryDocs(summary));
-      }
-
-      // Sync in batches
-      for (let i = 0; i < summaryDocs.length; i += this.BATCH_SIZE) {
-        const batch = summaryDocs.slice(i, i + this.BATCH_SIZE);
-        await this.addDocuments(batch);
-
-        logger.info('CHROMA_SYNC', 'Backfill progress', {
-          project: this.project,
-          progress: `${Math.min(i + this.BATCH_SIZE, summaryDocs.length)}/${summaryDocs.length}`
-        });
-      }
-
-      // Build exclusion list for prompts
-      const existingPromptIds = Array.from(existing.prompts);
-      const promptExclusionClause = existingPromptIds.length > 0
-        ? `AND up.id NOT IN (${existingPromptIds.join(',')})`
-        : '';
-
-      // Get only user prompts missing from Chroma
-      const prompts = db.db.prepare(`
-        SELECT
-          up.*,
-          s.project,
-          s.sdk_session_id
-        FROM user_prompts up
-        JOIN sdk_sessions s ON up.claude_session_id = s.claude_session_id
-        WHERE s.project = ? ${promptExclusionClause}
-        ORDER BY up.id ASC
-      `).all(this.project) as StoredUserPrompt[];
-
-      const totalPromptCount = db.db.prepare(`
-        SELECT COUNT(*) as count
-        FROM user_prompts up
-        JOIN sdk_sessions s ON up.claude_session_id = s.claude_session_id
-        WHERE s.project = ?
-      `).get(this.project) as { count: number };
-
-      logger.info('CHROMA_SYNC', 'Backfilling user prompts', {
-        project: this.project,
-        missing: prompts.length,
-        existing: existing.prompts.size,
-        total: totalPromptCount.count
-      });
-
-      // Format all prompt documents
-      const promptDocs: ChromaDocument[] = [];
-      for (const prompt of prompts) {
-        promptDocs.push(this.formatUserPromptDoc(prompt));
-      }
-
-      // Sync in batches
-      for (let i = 0; i < promptDocs.length; i += this.BATCH_SIZE) {
-        const batch = promptDocs.slice(i, i + this.BATCH_SIZE);
-        await this.addDocuments(batch);
-
-        logger.info('CHROMA_SYNC', 'Backfill progress', {
-          project: this.project,
-          progress: `${Math.min(i + this.BATCH_SIZE, promptDocs.length)}/${promptDocs.length}`
-        });
-      }
-
-      logger.info('CHROMA_SYNC', 'Smart backfill complete', {
-        project: this.project,
-        synced: {
-          observationDocs: allDocs.length,
-          summaryDocs: summaryDocs.length,
-          promptDocs: promptDocs.length
-        },
-        skipped: {
-          observations: existing.observations.size,
-          summaries: existing.summaries.size,
-          prompts: existing.prompts.size
-        }
-      });
-
+      await this.runBackfillPipeline(db, backfillProject, watermarks);
     } catch (error) {
-      logger.error('CHROMA_SYNC', 'Backfill failed', { project: this.project }, error as Error);
+      logger.error('CHROMA_SYNC', 'Backfill failed', { project: backfillProject }, error instanceof Error ? error : new Error(String(error)));
       throw new Error(`Backfill failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
-      db.close();
+      if (!storeOverride) {
+        db.close();
+      }
     }
   }
 
-  /**
-   * Query Chroma collection for semantic search
-   * Used by SearchManager for vector-based search
-   */
+  private async runBackfillPipeline(
+    db: SessionStore,
+    backfillProject: string,
+    watermarks: ProjectWatermarks
+  ): Promise<void> {
+    const allDocs = await this.backfillObservations(db, backfillProject, watermarks.observations);
+    const summaryDocs = await this.backfillSummaries(db, backfillProject, watermarks.summaries);
+    const promptDocs = await this.backfillPrompts(db, backfillProject, watermarks.prompts);
+
+    logger.info('CHROMA_SYNC', 'Smart backfill complete', {
+      project: backfillProject,
+      synced: {
+        observationDocs: allDocs.length,
+        summaryDocs: summaryDocs.length,
+        promptDocs: promptDocs.length
+      },
+      watermarks: ChromaSyncState.get(backfillProject)
+    });
+  }
+
+  private async backfillObservations(
+    db: SessionStore,
+    backfillProject: string,
+    watermark: number
+  ): Promise<ChromaDocument[]> {
+    const observations = db.db.prepare(`
+      SELECT * FROM observations
+      WHERE project = ? AND id > ?
+      ORDER BY id ASC
+    `).all(backfillProject, watermark) as StoredObservation[];
+
+    if (observations.length === 0) {
+      return [];
+    }
+
+    const totalObsCount = db.db.prepare(`
+      SELECT COUNT(*) as count FROM observations WHERE project = ?
+    `).get(backfillProject) as { count: number };
+
+    logger.info('CHROMA_SYNC', 'Backfilling observations', {
+      project: backfillProject,
+      missing: observations.length,
+      watermark,
+      total: totalObsCount.count
+    });
+
+    const allDocs: ChromaDocument[] = [];
+    const obsByDocCount: Array<{ obs: StoredObservation; docs: ChromaDocument[] }> = [];
+    for (const obs of observations) {
+      const docs = this.formatObservationDocs(obs);
+      allDocs.push(...docs);
+      obsByDocCount.push({ obs, docs });
+    }
+
+    // Watermark must be durable per-batch: SIGKILL / OOM / reboot mid-flight
+    // skips any trailing finally, so a once-at-end bump leaves the watermark
+    // at zero and the next boot re-embeds everything (#2214, amplifies #2220).
+    //
+    // Non-contiguous failure guard: once any batch under-writes, ALL later
+    // batches must also skip the watermark bump. The watermark is a single
+    // monotonic id, so it cannot represent "synced through 200, then a gap at
+    // 201–250, then 251 onward" — bumping past the gap would silently drop
+    // 201–250 forever (CodeRabbit review on PR #2282).
+    let writtenDocs = 0;
+    let lastSyncedObsIdx = -1;
+    let hadGap = false;
+    for (let i = 0; i < allDocs.length; i += this.BATCH_SIZE) {
+      const batch = allDocs.slice(i, i + this.BATCH_SIZE);
+      const writtenInBatch = await this.addDocuments(batch);
+      // Only advance the watermark for documents that actually landed in
+      // Chroma. addDocuments() logs and continues on per-batch failures, so a
+      // partial write must not mark unwritten docs as synced.
+      if (writtenInBatch < batch.length) {
+        hadGap = true;
+        logger.debug('CHROMA_SYNC', 'Skipping watermark bump for failed/partial batch', {
+          project: backfillProject,
+          batchStart: i,
+          requested: batch.length,
+          written: writtenInBatch
+        });
+        continue;
+      }
+      if (hadGap) {
+        // A previous batch left a gap; downstream batches cannot bump the
+        // watermark even if they themselves succeeded.
+        logger.debug('CHROMA_SYNC', 'Skipping watermark bump after prior gap', {
+          project: backfillProject,
+          batchStart: i
+        });
+        continue;
+      }
+      writtenDocs += writtenInBatch;
+
+      let cursor = 0;
+      for (let j = 0; j < obsByDocCount.length; j++) {
+        cursor += obsByDocCount[j].docs.length;
+        if (cursor <= writtenDocs) {
+          lastSyncedObsIdx = j;
+        } else {
+          break;
+        }
+      }
+
+      if (lastSyncedObsIdx >= 0) {
+        ChromaSyncState.bump(
+          backfillProject,
+          'observations',
+          obsByDocCount[lastSyncedObsIdx].obs.id
+        );
+      }
+
+      logger.debug('CHROMA_SYNC', 'Backfill progress', {
+        project: backfillProject,
+        progress: `${Math.min(i + this.BATCH_SIZE, allDocs.length)}/${allDocs.length}`
+      });
+    }
+
+    return allDocs;
+  }
+
+  private async backfillSummaries(
+    db: SessionStore,
+    backfillProject: string,
+    watermark: number
+  ): Promise<ChromaDocument[]> {
+    const summaries = db.db.prepare(`
+      SELECT * FROM session_summaries
+      WHERE project = ? AND id > ?
+      ORDER BY id ASC
+    `).all(backfillProject, watermark) as StoredSummary[];
+
+    if (summaries.length === 0) {
+      return [];
+    }
+
+    const totalSummaryCount = db.db.prepare(`
+      SELECT COUNT(*) as count FROM session_summaries WHERE project = ?
+    `).get(backfillProject) as { count: number };
+
+    logger.info('CHROMA_SYNC', 'Backfilling summaries', {
+      project: backfillProject,
+      missing: summaries.length,
+      watermark,
+      total: totalSummaryCount.count
+    });
+
+    const summaryDocs: ChromaDocument[] = [];
+    const summaryByDocCount: Array<{ summary: StoredSummary; docs: ChromaDocument[] }> = [];
+    for (const summary of summaries) {
+      const docs = this.formatSummaryDocs(summary);
+      summaryDocs.push(...docs);
+      summaryByDocCount.push({ summary, docs });
+    }
+
+    // Non-contiguous failure guard: see backfillObservations() for rationale.
+    let writtenDocs = 0;
+    let lastSyncedIdx = -1;
+    let hadGap = false;
+    for (let i = 0; i < summaryDocs.length; i += this.BATCH_SIZE) {
+      const batch = summaryDocs.slice(i, i + this.BATCH_SIZE);
+      const writtenInBatch = await this.addDocuments(batch);
+      // Only advance the watermark for documents that actually landed in
+      // Chroma. See the analogous comment in backfillObservations().
+      if (writtenInBatch < batch.length) {
+        hadGap = true;
+        logger.debug('CHROMA_SYNC', 'Skipping watermark bump for failed/partial batch', {
+          project: backfillProject,
+          batchStart: i,
+          requested: batch.length,
+          written: writtenInBatch
+        });
+        continue;
+      }
+      if (hadGap) {
+        logger.debug('CHROMA_SYNC', 'Skipping watermark bump after prior gap', {
+          project: backfillProject,
+          batchStart: i
+        });
+        continue;
+      }
+      writtenDocs += writtenInBatch;
+
+      let cursor = 0;
+      for (let j = 0; j < summaryByDocCount.length; j++) {
+        cursor += summaryByDocCount[j].docs.length;
+        if (cursor <= writtenDocs) lastSyncedIdx = j;
+        else break;
+      }
+
+      if (lastSyncedIdx >= 0) {
+        ChromaSyncState.bump(
+          backfillProject,
+          'summaries',
+          summaryByDocCount[lastSyncedIdx].summary.id
+        );
+      }
+
+      logger.debug('CHROMA_SYNC', 'Backfill progress', {
+        project: backfillProject,
+        progress: `${Math.min(i + this.BATCH_SIZE, summaryDocs.length)}/${summaryDocs.length}`
+      });
+    }
+
+    return summaryDocs;
+  }
+
+  private async backfillPrompts(
+    db: SessionStore,
+    backfillProject: string,
+    watermark: number
+  ): Promise<ChromaDocument[]> {
+    const prompts = db.db.prepare(`
+      SELECT
+        up.*,
+        s.project,
+        s.memory_session_id
+      FROM user_prompts up
+      JOIN sdk_sessions s ON up.content_session_id = s.content_session_id
+      WHERE s.project = ? AND up.id > ?
+      ORDER BY up.id ASC
+    `).all(backfillProject, watermark) as StoredUserPrompt[];
+
+    if (prompts.length === 0) {
+      return [];
+    }
+
+    const totalPromptCount = db.db.prepare(`
+      SELECT COUNT(*) as count
+      FROM user_prompts up
+      JOIN sdk_sessions s ON up.content_session_id = s.content_session_id
+      WHERE s.project = ?
+    `).get(backfillProject) as { count: number };
+
+    logger.info('CHROMA_SYNC', 'Backfilling user prompts', {
+      project: backfillProject,
+      missing: prompts.length,
+      watermark,
+      total: totalPromptCount.count
+    });
+
+    const promptDocs: ChromaDocument[] = [];
+    for (const prompt of prompts) {
+      promptDocs.push(this.formatUserPromptDoc(prompt));
+    }
+
+    // Prompts are 1 doc each — bump the watermark per batch so an interrupted
+    // backfill resumes where it left off instead of re-embedding from zero.
+    // Only advance the watermark when the batch actually wrote — partial
+    // writes must not skip the failed prompts on restart.
+    //
+    // Non-contiguous failure guard: see backfillObservations() for rationale.
+    let hadGap = false;
+    for (let i = 0; i < promptDocs.length; i += this.BATCH_SIZE) {
+      const batch = promptDocs.slice(i, i + this.BATCH_SIZE);
+      const writtenInBatch = await this.addDocuments(batch);
+      const upTo = Math.min(i + this.BATCH_SIZE, prompts.length);
+      if (writtenInBatch < batch.length) {
+        hadGap = true;
+        logger.debug('CHROMA_SYNC', 'Skipping prompt watermark bump for failed/partial batch', {
+          project: backfillProject,
+          batchStart: i,
+          requested: batch.length,
+          written: writtenInBatch
+        });
+        continue;
+      }
+      if (hadGap) {
+        logger.debug('CHROMA_SYNC', 'Skipping prompt watermark bump after prior gap', {
+          project: backfillProject,
+          batchStart: i
+        });
+        continue;
+      }
+      const lastSyncedPromptId = prompts[upTo - 1].id;
+      ChromaSyncState.bump(backfillProject, 'prompts', lastSyncedPromptId);
+
+      logger.debug('CHROMA_SYNC', 'Backfill progress', {
+        project: backfillProject,
+        progress: `${upTo}/${promptDocs.length}`
+      });
+    }
+
+    return promptDocs;
+  }
+
   async queryChroma(
     query: string,
     limit: number,
     whereFilter?: Record<string, any>
   ): Promise<{ ids: number[]; distances: number[]; metadatas: any[] }> {
-    await this.ensureConnection();
+    await this.ensureCollectionExists();
 
-    if (!this.client) {
-      throw new Error(
-        'Chroma client not initialized. Call ensureConnection() before using client methods.' +
-        ` Project: ${this.project}`
-      );
-    }
-
-    const whereStringified = whereFilter ? JSON.stringify(whereFilter) : undefined;
-
-    const arguments_obj = {
-      collection_name: this.collectionName,
-      query_texts: [query],
-      n_results: limit,
-      include: ['documents', 'metadatas', 'distances'],
-      where: whereStringified
-    };
-
-    const result = await this.client.callTool({
-      name: 'chroma_query_documents',
-      arguments: arguments_obj
-    });
-
-    const resultText = logger.happyPathError(
-      'CHROMA',
-      'Missing text in MCP chroma_query_documents result',
-      { project: this.project },
-      { query_text: query },
-      result.content[0]?.text || ''
-    );
-
-    // Parse JSON response
-    let parsed: any;
+    let results: any;
     try {
-      parsed = JSON.parse(resultText);
+      const chromaMcp = ChromaMcpManager.getInstance();
+      results = await chromaMcp.callTool('chroma_query_documents', {
+        collection_name: this.collectionName,
+        query_texts: [query],
+        n_results: limit,
+        ...(whereFilter && { where: whereFilter }),
+        include: ['documents', 'metadatas', 'distances']
+      });
     } catch (error) {
-      logger.error('CHROMA_SYNC', 'Failed to parse Chroma response', { project: this.project }, error as Error);
-      return { ids: [], distances: [], metadatas: [] };
+      const errorMessage = error instanceof Error ? error.message : String(error);
+
+      const isConnectionError =
+        errorMessage.includes('ECONNREFUSED') || 
+        errorMessage.includes('ENOTFOUND') || 
+        errorMessage.includes('fetch failed') || 
+        errorMessage.includes('subprocess closed') || 
+        errorMessage.includes('timed out'); 
+
+      if (isConnectionError) {
+        this.collectionCreated = false;
+        logger.error('CHROMA_SYNC', 'Connection lost during query',
+          { project: this.project, query }, error as Error);
+        throw new Error(`Chroma query failed - connection lost: ${errorMessage}`);
+      }
+
+      logger.error('CHROMA_SYNC', 'Query failed', { project: this.project, query }, error as Error);
+      throw error;
     }
 
-    // Extract unique IDs from document IDs
+    return this.deduplicateQueryResults(results);
+  }
+
+  private deduplicateQueryResults(results: any): { ids: number[]; distances: number[]; metadatas: any[] } {
     const ids: number[] = [];
-    const docIds = parsed.ids?.[0] || [];
-    for (const docId of docIds) {
-      // Extract sqlite_id from document ID (supports three formats):
-      // - obs_{id}_narrative, obs_{id}_fact_0, etc (observations)
-      // - summary_{id}_request, summary_{id}_learned, etc (session summaries)
-      // - prompt_{id} (user prompts)
+    const seen = new Set<string>();
+    const docIds = results?.ids?.[0] || [];
+    const rawMetadatas = results?.metadatas?.[0] || [];
+    const rawDistances = results?.distances?.[0] || [];
+
+    const metadatas: any[] = [];
+    const distances: number[] = [];
+
+    for (let i = 0; i < docIds.length; i++) {
+      const docId = docIds[i];
       const obsMatch = docId.match(/obs_(\d+)_/);
       const summaryMatch = docId.match(/summary_(\d+)_/);
       const promptMatch = docId.match(/prompt_(\d+)/);
 
       let sqliteId: number | null = null;
+      let entityType: string | null = null;
       if (obsMatch) {
         sqliteId = parseInt(obsMatch[1], 10);
+        entityType = 'observation';
       } else if (summaryMatch) {
         sqliteId = parseInt(summaryMatch[1], 10);
+        entityType = 'session_summary';
       } else if (promptMatch) {
         sqliteId = parseInt(promptMatch[1], 10);
+        entityType = 'user_prompt';
       }
 
-      if (sqliteId !== null && !ids.includes(sqliteId)) {
+      if (sqliteId !== null && entityType) {
+        const dedupeKey = `${entityType}:${sqliteId}`;
+        if (seen.has(dedupeKey)) continue;
+        seen.add(dedupeKey);
         ids.push(sqliteId);
+        metadatas.push(rawMetadatas[i] ?? null);
+        distances.push(rawDistances[i] ?? 0);
       }
     }
-
-    const distances = parsed.distances?.[0] || [];
-    const metadatas = parsed.metadatas?.[0] || [];
 
     return { ids, distances, metadatas };
   }
 
+  /** Maximum number of concurrent project backfills to run at once. */
+  private static readonly BACKFILL_CONCURRENCY_LIMIT = 3;
+
+  /** Guard flag to prevent overlapping backfill runs from fire-and-forget callers. */
+  private static backfillInProgress = false;
+
   /**
-   * Close the Chroma client connection and cleanup subprocess
+   * Backfill all projects that have observations in SQLite but may be missing from Chroma.
+   * Uses a single shared ChromaSync('claude-mem') instance and Chroma connection.
+   * Per-project scoping is passed as a parameter to ensureBackfilled(), avoiding
+   * instance state mutation. All documents land in the cm__claude-mem collection
+   * with project scoped via metadata, matching how DatabaseManager and SearchManager operate.
+   * Designed to be called fire-and-forget on worker startup.
+   *
+   * Concurrency: processes at most BACKFILL_CONCURRENCY_LIMIT projects in parallel
+   * to bound CPU and memory pressure from concurrent Chroma embedding operations.
+   * A re-entrant guard prevents overlapping backfill runs from accumulating.
    */
-  async close(): Promise<void> {
-    if (!this.connected && !this.client && !this.transport) {
+  static async backfillAllProjects(storeOverride?: SessionStore): Promise<void> {
+    if (ChromaSync.backfillInProgress) {
+      logger.info('CHROMA_SYNC', 'Backfill already in progress, skipping duplicate run');
       return;
     }
 
+    // Allocate first so a constructor throw cannot leave the guard stuck true
+    // and silently skip every subsequent backfill (CodeRabbit review on PR
+    // #2282). The guard only flips to true after both resources are alive,
+    // and the finally always clears it.
+    let db: SessionStore | undefined;
+    let sync: ChromaSync | undefined;
     try {
-      // Close client first
-      if (this.client) {
-        try {
-          await this.client.close();
-        } catch (error) {
-          logger.warn('CHROMA_SYNC', 'Error closing Chroma client', { project: this.project }, error as Error);
-        }
+      db = storeOverride ?? new SessionStore();
+      sync = new ChromaSync('claude-mem');
+    } catch (error) {
+      logger.error('CHROMA_SYNC', 'Failed to initialize backfill resources',
+        {}, error instanceof Error ? error : new Error(String(error)));
+      // Best-effort cleanup if SessionStore allocated but ChromaSync threw.
+      if (db && !storeOverride) {
+        try { db.close(); } catch { /* ignore */ }
       }
-
-      // Explicitly close transport to kill subprocess
-      if (this.transport) {
-        try {
-          await this.transport.close();
-        } catch (error) {
-          logger.warn('CHROMA_SYNC', 'Error closing transport', { project: this.project }, error as Error);
-        }
-      }
-
-      logger.info('CHROMA_SYNC', 'Chroma client and subprocess closed', { project: this.project });
-    } finally {
-      // Always reset state, even if errors occurred
-      this.connected = false;
-      this.client = null;
-      this.transport = null;
+      throw error;
     }
+
+    ChromaSync.backfillInProgress = true;
+    try {
+      const projects = db.db.prepare(
+        'SELECT DISTINCT project FROM observations WHERE project IS NOT NULL AND project != ?'
+      ).all('') as { project: string }[];
+
+      logger.info('CHROMA_SYNC', `Backfill check for ${projects.length} projects`);
+
+      if (!ChromaSyncState.exists()) {
+        logger.info('CHROMA_SYNC', 'Watermark cache missing — bootstrapping from Chroma (one-time)');
+        for (const { project } of projects) {
+          try {
+            await sync.bootstrapWatermarksFromChroma(project);
+          } catch (error) {
+            logger.error('CHROMA_SYNC', `Bootstrap failed for project: ${project}`,
+              {}, error instanceof Error ? error : new Error(String(error)));
+          }
+        }
+        logger.info('CHROMA_SYNC', 'Bootstrap complete — incremental backfills will use watermarks');
+      }
+
+      // Process projects in chunks of BACKFILL_CONCURRENCY_LIMIT to bound
+      // CPU/memory pressure from concurrent Chroma embedding operations.
+      // Each chunk runs its projects in parallel; we wait for the entire chunk
+      // before starting the next one. Simple and predictable — no semaphore
+      // overhead, no unbounded fan-out.
+      const concurrency = ChromaSync.BACKFILL_CONCURRENCY_LIMIT;
+      for (let i = 0; i < projects.length; i += concurrency) {
+        const chunk = projects.slice(i, i + concurrency);
+        const chunkResults = await Promise.allSettled(
+          chunk.map(({ project }) => sync!.ensureBackfilled(project, db!))
+        );
+
+        for (let j = 0; j < chunkResults.length; j++) {
+          const result = chunkResults[j];
+          if (result.status === 'rejected') {
+            const project = chunk[j].project;
+            const error = result.reason;
+            if (error instanceof Error) {
+              logger.error('CHROMA_SYNC', `Backfill failed for project: ${project}`, {}, error);
+            } else {
+              logger.error('CHROMA_SYNC', `Backfill failed for project: ${project}`, { error: String(error) });
+            }
+            // Continue to next chunk — don't let one failure stop others
+          }
+        }
+      }
+    } finally {
+      ChromaSync.backfillInProgress = false;
+      if (sync) {
+        try { await sync.close(); } catch (closeError) {
+          logger.debug('CHROMA_SYNC', 'sync.close() failed during backfill teardown',
+            {}, closeError instanceof Error ? closeError : new Error(String(closeError)));
+        }
+      }
+      if (!storeOverride && db) {
+        try { db.close(); } catch (closeError) {
+          logger.debug('CHROMA_SYNC', 'db.close() failed during backfill teardown',
+            {}, closeError instanceof Error ? closeError : new Error(String(closeError)));
+        }
+      }
+    }
+  }
+
+  async updateMergedIntoProject(
+    sqliteIds: number[],
+    mergedIntoProject: string
+  ): Promise<void> {
+    if (sqliteIds.length === 0) return;
+
+    await this.ensureCollectionExists();
+    const chromaMcp = ChromaMcpManager.getInstance();
+
+    let totalPatched = 0;
+
+    for (let i = 0; i < sqliteIds.length; i += this.BATCH_SIZE) {
+      const idBatch = sqliteIds.slice(i, i + this.BATCH_SIZE);
+
+      const existing = await chromaMcp.callTool('chroma_get_documents', {
+        collection_name: this.collectionName,
+        where: { sqlite_id: { $in: idBatch } },
+        include: ['metadatas']
+      }) as { ids?: string[]; metadatas?: Array<Record<string, any> | null> };
+
+      const docIds: string[] = existing?.ids ?? [];
+      if (docIds.length === 0) continue;
+
+      const metadatas = (existing?.metadatas ?? []).map(m => {
+        const merged: Record<string, any> = {
+          ...(m ?? {}),
+          merged_into_project: mergedIntoProject
+        };
+        return Object.fromEntries(
+          Object.entries(merged).filter(
+            ([, v]) => v !== null && v !== undefined && v !== ''
+          )
+        );
+      });
+
+      await chromaMcp.callTool('chroma_update_documents', {
+        collection_name: this.collectionName,
+        ids: docIds,
+        metadatas
+      });
+      totalPatched += docIds.length;
+    }
+
+    logger.info('CHROMA_SYNC', 'merged_into_project metadata patched', {
+      collection: this.collectionName,
+      mergedIntoProject,
+      sqliteIdCount: sqliteIds.length,
+      chromaDocsPatched: totalPatched
+    });
+  }
+
+  async close(): Promise<void> {
+    logger.info('CHROMA_SYNC', 'ChromaSync closed', { project: this.project });
   }
 }

@@ -1,27 +1,41 @@
-/**
- * Shared types for Worker Service architecture
- */
 
 import type { Response } from 'express';
+import type { RestartGuard } from './worker/RestartGuard.js';
 
-// ============================================================================
-// Active Session Types
-// ============================================================================
+export interface ConversationMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
 
 export interface ActiveSession {
   sessionDbId: number;
-  claudeSessionId: string;
-  sdkSessionId: string | null;
+  contentSessionId: string;      
+  memorySessionId: string | null; 
   project: string;
+  platformSource: string;
   userPrompt: string;
-  pendingMessages: PendingMessage[];  // Deprecated: now using persistent store, kept for compatibility
+  pendingMessages: PendingMessage[];  
   abortController: AbortController;
   generatorPromise: Promise<void> | null;
   lastPromptNumber: number;
   startTime: number;
-  cumulativeInputTokens: number;   // Track input tokens for discovery cost
-  cumulativeOutputTokens: number;  // Track output tokens for discovery cost
-  pendingProcessingIds: Set<number>;  // Track ALL message IDs yielded but not yet processed
+  cumulativeInputTokens: number;   
+  cumulativeOutputTokens: number;  
+  earliestPendingTimestamp: number | null;  
+  claimedMessageIds: number[];
+  conversationHistory: ConversationMessage[];  
+  currentProvider: 'claude' | 'gemini' | 'openrouter' | null;  
+  consecutiveRestarts: number;  
+  restartGuard?: RestartGuard;
+  forceInit?: boolean;  
+  idleTimedOut?: boolean;  
+  lastGeneratorActivity: number;
+  modelOverride?: string;
+  lastSummaryStored?: boolean;
+  pendingAgentId?: string | null;
+  pendingAgentType?: string | null;
+  abortReason?: 'idle' | 'shutdown' | 'overflow' | 'restart-guard' | 'quota' | string | null;
+  respawnTimer?: ReturnType<typeof setTimeout>;
 }
 
 export interface PendingMessage {
@@ -31,15 +45,12 @@ export interface PendingMessage {
   tool_response?: any;
   prompt_number?: number;
   cwd?: string;
-  last_user_message?: string;
   last_assistant_message?: string;
+  agentId?: string;
+  agentType?: string;
+  toolUseId?: string;
 }
 
-/**
- * PendingMessage with database ID for completion tracking.
- * The _persistentId is used to mark the message as processed after SDK success.
- * The _originalTimestamp is the epoch when the message was first queued (for accurate observation timestamps).
- */
 export interface PendingMessageWithId extends PendingMessage {
   _persistentId: number;
   _originalTimestamp: number;
@@ -51,11 +62,10 @@ export interface ObservationData {
   tool_response: any;
   prompt_number: number;
   cwd?: string;
+  agentId?: string;
+  agentType?: string;
+  toolUseId?: string;
 }
-
-// ============================================================================
-// SSE Types
-// ============================================================================
 
 export interface SSEEvent {
   type: string;
@@ -64,10 +74,6 @@ export interface SSEEvent {
 }
 
 export type SSEClient = Response;
-
-// ============================================================================
-// Pagination Types
-// ============================================================================
 
 export interface PaginatedResult<T> {
   items: T[];
@@ -80,11 +86,8 @@ export interface PaginationParams {
   offset: number;
   limit: number;
   project?: string;
+  platformSource?: string;
 }
-
-// ============================================================================
-// Settings Types
-// ============================================================================
 
 export interface ViewerSettings {
   sidebarOpen: boolean;
@@ -92,14 +95,12 @@ export interface ViewerSettings {
   theme: 'light' | 'dark' | 'system';
 }
 
-// ============================================================================
-// Database Record Types
-// ============================================================================
-
 export interface Observation {
   id: number;
-  sdk_session_id: string;
+  memory_session_id: string;  
   project: string;
+  merged_into_project: string | null;
+  platform_source: string;
   type: string;
   title: string;
   subtitle: string | null;
@@ -116,8 +117,9 @@ export interface Observation {
 
 export interface Summary {
   id: number;
-  session_id: string; // claude_session_id (from JOIN)
+  session_id: string; 
   project: string;
+  platform_source: string;
   request: string | null;
   investigated: string | null;
   learned: string | null;
@@ -130,8 +132,9 @@ export interface Summary {
 
 export interface UserPrompt {
   id: number;
-  claude_session_id: string;
-  project: string; // From JOIN with sdk_sessions
+  content_session_id: string;  
+  project: string; 
+  platform_source: string;
   prompt_number: number;
   prompt_text: string;
   created_at: string;
@@ -140,10 +143,11 @@ export interface UserPrompt {
 
 export interface DBSession {
   id: number;
-  claude_session_id: string;
+  content_session_id: string;    
   project: string;
+  platform_source: string;
   user_prompt: string;
-  sdk_session_id: string | null;
+  memory_session_id: string | null;  
   status: 'active' | 'completed' | 'failed';
   started_at: string;
   started_at_epoch: number;
@@ -151,11 +155,6 @@ export interface DBSession {
   completed_at_epoch: number | null;
 }
 
-// ============================================================================
-// SDK Types
-// ============================================================================
-
-// Re-export the actual SDK type to ensure compatibility
 export type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
 
 export interface ParsedObservation {
@@ -175,10 +174,6 @@ export interface ParsedSummary {
   next_steps: string | null;
   notes: string | null;
 }
-
-// ============================================================================
-// Utility Types
-// ============================================================================
 
 export interface DatabaseStats {
   totalObservations: number;

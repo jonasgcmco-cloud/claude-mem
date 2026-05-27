@@ -1,13 +1,12 @@
 import { Database } from 'bun:sqlite';
 import { Migration } from './Database.js';
+import { logger } from '../../utils/logger.js';
 
-/**
- * Initial schema migration - creates all core tables
- */
+export { MigrationRunner } from './migrations/runner.js';
+
 export const migration001: Migration = {
   version: 1,
   up: (db: Database) => {
-    // Sessions table - core session tracking
     db.run(`
       CREATE TABLE IF NOT EXISTS sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,7 +27,6 @@ export const migration001: Migration = {
       CREATE INDEX IF NOT EXISTS idx_sessions_project_created ON sessions(project, created_at_epoch DESC);
     `);
 
-    // Memories table - compressed memory chunks
     db.run(`
       CREATE TABLE IF NOT EXISTS memories (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +50,6 @@ export const migration001: Migration = {
       CREATE INDEX IF NOT EXISTS idx_memories_origin ON memories(origin);
     `);
 
-    // Overviews table - session summaries (one per project)
     db.run(`
       CREATE TABLE IF NOT EXISTS overviews (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,7 +69,6 @@ export const migration001: Migration = {
       CREATE UNIQUE INDEX IF NOT EXISTS idx_overviews_project_latest ON overviews(project, created_at_epoch DESC);
     `);
 
-    // Diagnostics table - system health and debug info
     db.run(`
       CREATE TABLE IF NOT EXISTS diagnostics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,7 +88,6 @@ export const migration001: Migration = {
       CREATE INDEX IF NOT EXISTS idx_diagnostics_created ON diagnostics(created_at_epoch DESC);
     `);
 
-    // Transcript events table - raw conversation events
     db.run(`
       CREATE TABLE IF NOT EXISTS transcript_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,13 +122,9 @@ export const migration001: Migration = {
   }
 };
 
-/**
- * Migration 002 - Add hierarchical memory fields (v2 format)
- */
 export const migration002: Migration = {
   version: 2,
   up: (db: Database) => {
-    // Add new columns for hierarchical memory structure
     db.run(`
       ALTER TABLE memories ADD COLUMN title TEXT;
       ALTER TABLE memories ADD COLUMN subtitle TEXT;
@@ -142,7 +133,6 @@ export const migration002: Migration = {
       ALTER TABLE memories ADD COLUMN files_touched TEXT;
     `);
 
-    // Create indexes for the new fields to improve search performance
     db.run(`
       CREATE INDEX IF NOT EXISTS idx_memories_title ON memories(title);
       CREATE INDEX IF NOT EXISTS idx_memories_concepts ON memories(concepts);
@@ -152,26 +142,19 @@ export const migration002: Migration = {
   },
 
   down: (_db: Database) => {
-    // Note: SQLite doesn't support DROP COLUMN in all versions
-    // In production, we'd need to recreate the table without these columns
-    // For now, we'll just log a warning
     console.log('⚠️  Warning: SQLite ALTER TABLE DROP COLUMN not fully supported');
     console.log('⚠️  To rollback, manually recreate the memories table');
   }
 };
 
-/**
- * Migration 003 - Add streaming_sessions table for real-time session tracking
- */
 export const migration003: Migration = {
   version: 3,
   up: (db: Database) => {
-    // Streaming sessions table - tracks active SDK compression sessions
     db.run(`
       CREATE TABLE IF NOT EXISTS streaming_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        claude_session_id TEXT UNIQUE NOT NULL,
-        sdk_session_id TEXT,
+        content_session_id TEXT UNIQUE NOT NULL,
+        memory_session_id TEXT,
         project TEXT NOT NULL,
         title TEXT,
         subtitle TEXT,
@@ -185,8 +168,8 @@ export const migration003: Migration = {
         status TEXT NOT NULL DEFAULT 'active'
       );
 
-      CREATE INDEX IF NOT EXISTS idx_streaming_sessions_claude_id ON streaming_sessions(claude_session_id);
-      CREATE INDEX IF NOT EXISTS idx_streaming_sessions_sdk_id ON streaming_sessions(sdk_session_id);
+      CREATE INDEX IF NOT EXISTS idx_streaming_sessions_claude_id ON streaming_sessions(content_session_id);
+      CREATE INDEX IF NOT EXISTS idx_streaming_sessions_sdk_id ON streaming_sessions(memory_session_id);
       CREATE INDEX IF NOT EXISTS idx_streaming_sessions_project ON streaming_sessions(project);
       CREATE INDEX IF NOT EXISTS idx_streaming_sessions_status ON streaming_sessions(status);
       CREATE INDEX IF NOT EXISTS idx_streaming_sessions_started ON streaming_sessions(started_at_epoch DESC);
@@ -202,19 +185,14 @@ export const migration003: Migration = {
   }
 };
 
-/**
- * Migration 004 - Add SDK agent architecture tables
- * Implements the refactor plan for hook-driven memory with SDK agent synthesis
- */
 export const migration004: Migration = {
   version: 4,
   up: (db: Database) => {
-    // SDK sessions table - tracks SDK streaming sessions
     db.run(`
       CREATE TABLE IF NOT EXISTS sdk_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        claude_session_id TEXT UNIQUE NOT NULL,
-        sdk_session_id TEXT UNIQUE,
+        content_session_id TEXT UNIQUE NOT NULL,
+        memory_session_id TEXT UNIQUE,
         project TEXT NOT NULL,
         user_prompt TEXT,
         started_at TEXT NOT NULL,
@@ -224,55 +202,52 @@ export const migration004: Migration = {
         status TEXT CHECK(status IN ('active', 'completed', 'failed')) NOT NULL DEFAULT 'active'
       );
 
-      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_claude_id ON sdk_sessions(claude_session_id);
-      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_sdk_id ON sdk_sessions(sdk_session_id);
+      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_claude_id ON sdk_sessions(content_session_id);
+      CREATE INDEX IF NOT EXISTS idx_sdk_sessions_sdk_id ON sdk_sessions(memory_session_id);
       CREATE INDEX IF NOT EXISTS idx_sdk_sessions_project ON sdk_sessions(project);
       CREATE INDEX IF NOT EXISTS idx_sdk_sessions_status ON sdk_sessions(status);
       CREATE INDEX IF NOT EXISTS idx_sdk_sessions_started ON sdk_sessions(started_at_epoch DESC);
     `);
 
-    // Observation queue table - tracks pending observations for SDK processing
     db.run(`
       CREATE TABLE IF NOT EXISTS observation_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sdk_session_id TEXT NOT NULL,
+        memory_session_id TEXT NOT NULL,
         tool_name TEXT NOT NULL,
         tool_input TEXT NOT NULL,
         tool_output TEXT NOT NULL,
         created_at_epoch INTEGER NOT NULL,
         processed_at_epoch INTEGER,
-        FOREIGN KEY(sdk_session_id) REFERENCES sdk_sessions(sdk_session_id) ON DELETE CASCADE
+        FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE
       );
 
-      CREATE INDEX IF NOT EXISTS idx_observation_queue_sdk_session ON observation_queue(sdk_session_id);
+      CREATE INDEX IF NOT EXISTS idx_observation_queue_sdk_session ON observation_queue(memory_session_id);
       CREATE INDEX IF NOT EXISTS idx_observation_queue_processed ON observation_queue(processed_at_epoch);
-      CREATE INDEX IF NOT EXISTS idx_observation_queue_pending ON observation_queue(sdk_session_id, processed_at_epoch);
+      CREATE INDEX IF NOT EXISTS idx_observation_queue_pending ON observation_queue(memory_session_id, processed_at_epoch);
     `);
 
-    // Observations table - stores extracted observations (what SDK decides is important)
     db.run(`
       CREATE TABLE IF NOT EXISTS observations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sdk_session_id TEXT NOT NULL,
+        memory_session_id TEXT NOT NULL,
         project TEXT NOT NULL,
         text TEXT NOT NULL,
-        type TEXT NOT NULL CHECK(type IN ('decision', 'bugfix', 'feature', 'refactor', 'discovery')),
+        type TEXT NOT NULL,
         created_at TEXT NOT NULL,
         created_at_epoch INTEGER NOT NULL,
-        FOREIGN KEY(sdk_session_id) REFERENCES sdk_sessions(sdk_session_id) ON DELETE CASCADE
+        FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE
       );
 
-      CREATE INDEX IF NOT EXISTS idx_observations_sdk_session ON observations(sdk_session_id);
+      CREATE INDEX IF NOT EXISTS idx_observations_sdk_session ON observations(memory_session_id);
       CREATE INDEX IF NOT EXISTS idx_observations_project ON observations(project);
       CREATE INDEX IF NOT EXISTS idx_observations_type ON observations(type);
       CREATE INDEX IF NOT EXISTS idx_observations_created ON observations(created_at_epoch DESC);
     `);
 
-    // Session summaries table - stores structured session summaries
     db.run(`
       CREATE TABLE IF NOT EXISTS session_summaries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sdk_session_id TEXT UNIQUE NOT NULL,
+        memory_session_id TEXT UNIQUE NOT NULL,
         project TEXT NOT NULL,
         request TEXT,
         investigated TEXT,
@@ -284,10 +259,10 @@ export const migration004: Migration = {
         notes TEXT,
         created_at TEXT NOT NULL,
         created_at_epoch INTEGER NOT NULL,
-        FOREIGN KEY(sdk_session_id) REFERENCES sdk_sessions(sdk_session_id) ON DELETE CASCADE
+        FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE
       );
 
-      CREATE INDEX IF NOT EXISTS idx_session_summaries_sdk_session ON session_summaries(sdk_session_id);
+      CREATE INDEX IF NOT EXISTS idx_session_summaries_sdk_session ON session_summaries(memory_session_id);
       CREATE INDEX IF NOT EXISTS idx_session_summaries_project ON session_summaries(project);
       CREATE INDEX IF NOT EXISTS idx_session_summaries_created ON session_summaries(created_at_epoch DESC);
     `);
@@ -305,32 +280,22 @@ export const migration004: Migration = {
   }
 };
 
-/**
- * Migration 005 - Remove orphaned tables
- * Drops streaming_sessions (superseded by sdk_sessions)
- * Drops observation_queue (superseded by Unix socket communication)
- */
 export const migration005: Migration = {
   version: 5,
   up: (db: Database) => {
-    // Drop streaming_sessions - superseded by sdk_sessions in migration004
-    // This table was from v2 architecture and is no longer used
     db.run(`DROP TABLE IF EXISTS streaming_sessions`);
 
-    // Drop observation_queue - superseded by Unix socket communication
-    // Worker now uses sockets instead of database polling for observations
     db.run(`DROP TABLE IF EXISTS observation_queue`);
 
     console.log('✅ Dropped orphaned tables: streaming_sessions, observation_queue');
   },
 
   down: (db: Database) => {
-    // Recreate tables if needed (though they should never be used)
     db.run(`
       CREATE TABLE IF NOT EXISTS streaming_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        claude_session_id TEXT UNIQUE NOT NULL,
-        sdk_session_id TEXT,
+        content_session_id TEXT UNIQUE NOT NULL,
+        memory_session_id TEXT,
         project TEXT NOT NULL,
         title TEXT,
         subtitle TEXT,
@@ -348,13 +313,13 @@ export const migration005: Migration = {
     db.run(`
       CREATE TABLE IF NOT EXISTS observation_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        sdk_session_id TEXT NOT NULL,
+        memory_session_id TEXT NOT NULL,
         tool_name TEXT NOT NULL,
         tool_input TEXT NOT NULL,
         tool_output TEXT NOT NULL,
         created_at_epoch INTEGER NOT NULL,
         processed_at_epoch INTEGER,
-        FOREIGN KEY(sdk_session_id) REFERENCES sdk_sessions(sdk_session_id) ON DELETE CASCADE
+        FOREIGN KEY(memory_session_id) REFERENCES sdk_sessions(memory_session_id) ON DELETE CASCADE
       )
     `);
 
@@ -362,16 +327,17 @@ export const migration005: Migration = {
   }
 };
 
-/**
- * Migration 006 - Add FTS5 full-text search tables
- * Creates virtual tables for fast text search on observations and session_summaries
- */
 export const migration006: Migration = {
   version: 6,
   up: (db: Database) => {
-    // FTS5 virtual table for observations
-    // Note: This assumes the hierarchical fields (title, subtitle, etc.) already exist
-    // from the inline migrations in SessionStore constructor
+    try {
+      db.run('CREATE VIRTUAL TABLE _fts5_probe USING fts5(test_column)');
+      db.run('DROP TABLE _fts5_probe');
+    } catch (error) {
+      logger.warn('DB', 'FTS5 not available on this platform — skipping FTS migration (search uses ChromaDB)', {}, error instanceof Error ? error : undefined);
+      return;
+    }
+
     db.run(`
       CREATE VIRTUAL TABLE IF NOT EXISTS observations_fts USING fts5(
         title,
@@ -385,14 +351,12 @@ export const migration006: Migration = {
       );
     `);
 
-    // Populate FTS table with existing data
     db.run(`
       INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
       SELECT id, title, subtitle, narrative, text, facts, concepts
       FROM observations;
     `);
 
-    // Triggers to keep observations_fts in sync
     db.run(`
       CREATE TRIGGER IF NOT EXISTS observations_ai AFTER INSERT ON observations BEGIN
         INSERT INTO observations_fts(rowid, title, subtitle, narrative, text, facts, concepts)
@@ -412,7 +376,6 @@ export const migration006: Migration = {
       END;
     `);
 
-    // FTS5 virtual table for session_summaries
     db.run(`
       CREATE VIRTUAL TABLE IF NOT EXISTS session_summaries_fts USING fts5(
         request,
@@ -426,14 +389,12 @@ export const migration006: Migration = {
       );
     `);
 
-    // Populate FTS table with existing data
     db.run(`
       INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
       SELECT id, request, investigated, learned, completed, next_steps, notes
       FROM session_summaries;
     `);
 
-    // Triggers to keep session_summaries_fts in sync
     db.run(`
       CREATE TRIGGER IF NOT EXISTS session_summaries_ai AFTER INSERT ON session_summaries BEGIN
         INSERT INTO session_summaries_fts(rowid, request, investigated, learned, completed, next_steps, notes)
@@ -471,33 +432,109 @@ export const migration006: Migration = {
   }
 };
 
-/**
- * Migration 007 - Add discovery_tokens column for ROI metrics
- * Tracks token cost of discovering/creating each observation and summary
- */
 export const migration007: Migration = {
   version: 7,
   up: (db: Database) => {
-    // Add discovery_tokens to observations table
     db.run(`ALTER TABLE observations ADD COLUMN discovery_tokens INTEGER DEFAULT 0`);
 
-    // Add discovery_tokens to session_summaries table
     db.run(`ALTER TABLE session_summaries ADD COLUMN discovery_tokens INTEGER DEFAULT 0`);
 
     console.log('✅ Added discovery_tokens columns for ROI tracking');
   },
 
   down: (db: Database) => {
-    // Note: SQLite doesn't support DROP COLUMN in all versions
-    // In production, would need to recreate tables without these columns
     console.log('⚠️  Warning: SQLite ALTER TABLE DROP COLUMN not fully supported');
     console.log('⚠️  To rollback, manually recreate the observations and session_summaries tables');
   }
 };
 
-/**
- * All migrations in order
- */
+export const migration008: Migration = {
+  version: 25,
+  up: (db: Database) => {
+    db.run(`
+      CREATE TABLE IF NOT EXISTS observation_feedback (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        observation_id INTEGER NOT NULL,
+        signal_type TEXT NOT NULL,
+        session_db_id INTEGER,
+        created_at_epoch INTEGER NOT NULL,
+        metadata TEXT,
+        FOREIGN KEY (observation_id) REFERENCES observations(id) ON DELETE CASCADE
+      )
+    `);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_feedback_observation ON observation_feedback(observation_id)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_feedback_signal ON observation_feedback(signal_type)`);
+    console.log('✅ Created observation_feedback table for usage tracking');
+  },
+  down: (db: Database) => {
+    db.run(`DROP TABLE IF EXISTS observation_feedback`);
+  }
+};
+
+export const migration009: Migration = {
+  version: 26,
+  up: (db: Database) => {
+    const columns = db.prepare('PRAGMA table_info(observations)').all() as any[];
+    const hasGeneratedByModel = columns.some((c: any) => c.name === 'generated_by_model');
+    const hasRelevanceCount = columns.some((c: any) => c.name === 'relevance_count');
+
+    if (!hasGeneratedByModel) {
+      db.run('ALTER TABLE observations ADD COLUMN generated_by_model TEXT');
+    }
+    if (!hasRelevanceCount) {
+      db.run('ALTER TABLE observations ADD COLUMN relevance_count INTEGER DEFAULT 0');
+    }
+  },
+  down: (_db: Database) => {
+    // SQLite does not support DROP COLUMN in older versions; no-op
+  }
+};
+
+export const migration010: Migration = {
+  version: 27,
+  up: (db: Database) => {
+    const added: string[] = [];
+
+    const obsColumns = db.prepare('PRAGMA table_info(observations)').all() as Array<{ name: string }>;
+    const obsHasAgentType = obsColumns.some(c => c.name === 'agent_type');
+    const obsHasAgentId = obsColumns.some(c => c.name === 'agent_id');
+    if (!obsHasAgentType) {
+      db.run('ALTER TABLE observations ADD COLUMN agent_type TEXT');
+      added.push('observations.agent_type');
+    }
+    if (!obsHasAgentId) {
+      db.run('ALTER TABLE observations ADD COLUMN agent_id TEXT');
+      added.push('observations.agent_id');
+    }
+    db.run('CREATE INDEX IF NOT EXISTS idx_observations_agent_type ON observations(agent_type)');
+    db.run('CREATE INDEX IF NOT EXISTS idx_observations_agent_id ON observations(agent_id)');
+
+    const pendingColumns = db.prepare('PRAGMA table_info(pending_messages)').all() as Array<{ name: string }>;
+    if (pendingColumns.length > 0) {
+      const pendingHasAgentType = pendingColumns.some(c => c.name === 'agent_type');
+      const pendingHasAgentId = pendingColumns.some(c => c.name === 'agent_id');
+      if (!pendingHasAgentType) {
+        db.run('ALTER TABLE pending_messages ADD COLUMN agent_type TEXT');
+        added.push('pending_messages.agent_type');
+      }
+      if (!pendingHasAgentId) {
+        db.run('ALTER TABLE pending_messages ADD COLUMN agent_id TEXT');
+        added.push('pending_messages.agent_id');
+      }
+    }
+
+    logger.debug(
+      'DB',
+      added.length > 0
+        ? `[migration010] Added columns: ${added.join(', ')}`
+        : '[migration010] Subagent identity columns already present; ensured indexes'
+    );
+  },
+  down: (_db: Database) => {
+    // SQLite DROP COLUMN not fully supported; no-op
+  }
+};
+
 export const migrations: Migration[] = [
   migration001,
   migration002,
@@ -505,5 +542,8 @@ export const migrations: Migration[] = [
   migration004,
   migration005,
   migration006,
-  migration007
+  migration007,
+  migration008,
+  migration009,
+  migration010
 ];

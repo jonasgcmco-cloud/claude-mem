@@ -12,7 +12,7 @@ interface CliArgs {
   maxBudget?: number;
   verbose: boolean;
   force: boolean;
-  parallel: number;
+  useExisting: boolean;
   help: boolean;
   listLanguages: boolean;
 }
@@ -40,14 +40,14 @@ OPTIONS:
   --no-preserve-code      Translate code blocks too (not recommended)
   -m, --model <model>     Claude model to use (default: sonnet)
   --max-budget <usd>      Maximum budget in USD
+  --use-existing          Use existing translation file as a reference
   -v, --verbose           Show detailed progress
   -f, --force             Force re-translation ignoring cache
-  --parallel <n>          Run n translations concurrently (default: 1)
   -h, --help              Show this help message
   --list-languages        List all supported language codes
 
 EXAMPLES:
-  # Translate to Spanish and French
+  # Translate to Spanish and French (runs in parallel automatically)
   translate-readme README.md es fr
 
   # Translate to multiple languages with custom output
@@ -56,6 +56,10 @@ EXAMPLES:
   # Use in npm scripts
   # package.json: "translate": "translate-readme README.md es fr de"
 
+PERFORMANCE:
+  All translations run in parallel automatically (up to 10 concurrent).
+  Cache prevents re-translating unchanged files.
+
 SUPPORTED LANGUAGES:
   Run with --list-languages to see all supported language codes
 `);
@@ -63,7 +67,6 @@ SUPPORTED LANGUAGES:
 
 function printLanguages(): void {
   const LANGUAGE_NAMES: Record<string, string> = {
-    // Tier 1 - No-brainers
     zh: "Chinese (Simplified)",
     ja: "Japanese",
     "pt-br": "Brazilian Portuguese",
@@ -71,7 +74,6 @@ function printLanguages(): void {
     es: "Spanish",
     de: "German",
     fr: "French",
-    // Tier 2 - Strong tech scenes
     he: "Hebrew",
     ar: "Arabic",
     ru: "Russian",
@@ -80,22 +82,20 @@ function printLanguages(): void {
     nl: "Dutch",
     tr: "Turkish",
     uk: "Ukrainian",
-    // Tier 3 - Emerging/Growing fast
     vi: "Vietnamese",
     id: "Indonesian",
     th: "Thai",
     hi: "Hindi",
     bn: "Bengali",
+    ur: "Urdu",
     ro: "Romanian",
     sv: "Swedish",
-    // Tier 4 - Why not
     it: "Italian",
     el: "Greek",
     hu: "Hungarian",
     fi: "Finnish",
     da: "Danish",
     no: "Norwegian",
-    // Other supported
     bg: "Bulgarian",
     et: "Estonian",
     lt: "Lithuanian",
@@ -123,13 +123,13 @@ function parseArgs(argv: string[]): CliArgs {
     preserveCode: true,
     verbose: false,
     force: false,
-    parallel: 1,
+    useExisting: false,
     help: false,
     listLanguages: false,
   };
 
   const positional: string[] = [];
-  let i = 2; // Skip node and script path
+  let i = 2; 
 
   while (i < argv.length) {
     const arg = argv[i];
@@ -150,6 +150,9 @@ function parseArgs(argv: string[]): CliArgs {
       case "--force":
         args.force = true;
         break;
+      case "--use-existing":
+        args.useExisting = true;
+        break;
       case "--no-preserve-code":
         args.preserveCode = false;
         break;
@@ -167,13 +170,6 @@ function parseArgs(argv: string[]): CliArgs {
         break;
       case "--max-budget":
         args.maxBudget = parseFloat(argv[++i]);
-        break;
-      case "--parallel":
-        args.parallel = parseInt(argv[++i], 10);
-        if (isNaN(args.parallel) || args.parallel < 1) {
-          console.error("Error: --parallel must be a positive integer");
-          process.exit(1);
-        }
         break;
       default:
         if (arg.startsWith("-")) {
@@ -218,7 +214,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Validate language codes
   const invalidLangs = args.languages.filter(
     (lang) => !SUPPORTED_LANGUAGES.includes(lang.toLowerCase())
   );
@@ -239,10 +234,9 @@ async function main(): Promise<void> {
       maxBudgetUsd: args.maxBudget,
       verbose: args.verbose,
       force: args.force,
-      parallel: args.parallel,
+      useExisting: args.useExisting,
     });
 
-    // Exit with error code if any translations failed
     if (result.failed > 0) {
       process.exit(1);
     }

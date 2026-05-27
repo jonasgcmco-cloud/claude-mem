@@ -14,9 +14,12 @@ export function useSSE() {
   const eventSourceRef = useRef<EventSource | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
 
+  const addProjectIfNew = (project: string) => {
+    setProjects(prev => prev.includes(project) ? prev : [...prev, project]);
+  };
+
   useEffect(() => {
     const connect = () => {
-      // Clean up existing connection
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
       }
@@ -27,7 +30,6 @@ export function useSSE() {
       eventSource.onopen = () => {
         console.log('[SSE] Connected');
         setIsConnected(true);
-        // Clear any pending reconnect
         if (reconnectTimeoutRef.current) {
           clearTimeout(reconnectTimeoutRef.current);
         }
@@ -38,67 +40,61 @@ export function useSSE() {
         setIsConnected(false);
         eventSource.close();
 
-        // Reconnect after delay
         reconnectTimeoutRef.current = setTimeout(() => {
-          reconnectTimeoutRef.current = undefined; // Clear before reconnecting
+          reconnectTimeoutRef.current = undefined;
           console.log('[SSE] Attempting to reconnect...');
           connect();
         }, TIMING.SSE_RECONNECT_DELAY_MS);
       };
 
       eventSource.onmessage = (event) => {
-        try {
-          const data: StreamEvent = JSON.parse(event.data);
+        const data: StreamEvent = JSON.parse(event.data);
 
-          switch (data.type) {
-            case 'initial_load':
-              console.log('[SSE] Initial load:', {
-                projects: data.projects?.length || 0
-              });
-              // Only load projects list - data will come via pagination
-              setProjects(data.projects || []);
-              break;
+        switch (data.type) {
+          case 'initial_load':
+            console.log('[SSE] Initial load:', {
+              projects: data.projects?.length || 0
+            });
+            setProjects(data.projects || []);
+            break;
 
-            case 'new_observation':
-              if (data.observation) {
-                console.log('[SSE] New observation:', data.observation.id);
-                setObservations(prev => [data.observation, ...prev]);
-              }
-              break;
+          case 'new_observation':
+            if (data.observation) {
+              console.log('[SSE] New observation:', data.observation.id);
+              addProjectIfNew(data.observation.project);
+              setObservations(prev => [data.observation!, ...prev]);
+            }
+            break;
 
-            case 'new_summary':
-              if (data.summary) {
-                const summary = data.summary;
-                console.log('[SSE] New summary:', summary.id);
-                setSummaries(prev => [summary, ...prev]);
-              }
-              break;
+          case 'new_summary':
+            if (data.summary) {
+              console.log('[SSE] New summary:', data.summary.id);
+              addProjectIfNew(data.summary.project);
+              setSummaries(prev => [data.summary!, ...prev]);
+            }
+            break;
 
-            case 'new_prompt':
-              if (data.prompt) {
-                const prompt = data.prompt;
-                console.log('[SSE] New prompt:', prompt.id);
-                setPrompts(prev => [prompt, ...prev]);
-              }
-              break;
+          case 'new_prompt':
+            if (data.prompt) {
+              console.log('[SSE] New prompt:', data.prompt.id);
+              addProjectIfNew(data.prompt.project);
+              setPrompts(prev => [data.prompt!, ...prev]);
+            }
+            break;
 
-            case 'processing_status':
-              if (typeof data.isProcessing === 'boolean') {
-                console.log('[SSE] Processing status:', data.isProcessing, 'Queue depth:', data.queueDepth);
-                setIsProcessing(data.isProcessing);
-                setQueueDepth(data.queueDepth || 0);
-              }
-              break;
-          }
-        } catch (error) {
-          console.error('[SSE] Failed to parse message:', error);
+          case 'processing_status':
+            if (typeof data.isProcessing === 'boolean') {
+              console.log('[SSE] Processing status:', data.isProcessing, 'Queue depth:', data.queueDepth);
+              setIsProcessing(data.isProcessing);
+              setQueueDepth(data.queueDepth || 0);
+            }
+            break;
         }
       };
     };
 
     connect();
 
-    // Cleanup on unmount
     return () => {
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
@@ -109,5 +105,13 @@ export function useSSE() {
     };
   }, []);
 
-  return { observations, summaries, prompts, projects, isProcessing, queueDepth, isConnected };
+  return {
+    observations,
+    summaries,
+    prompts,
+    projects,
+    isProcessing,
+    queueDepth,
+    isConnected
+  };
 }
